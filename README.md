@@ -11,7 +11,9 @@ history rewrite in an application repo** (that happened in storytime_be in
 - Every change is a PR; bump `SCAN_SCRIPT_SHA256` in the workflow in the same
   PR whenever `scripts/scan-injection.sh` changes, then re-vendor the script to
   consumers.
-- Tag releases (`malware-scan-vN`) so consumers can pin a tag or a SHA.
+- Tag releases (`malware-scan-vN`) for humans; consumers must always pin the
+  full 40-char commit SHA (a `# malware-scan-vN` comment may annotate it).
+  Never pin a bare tag: tags are mutable.
 
 ## malware-scan
 
@@ -32,7 +34,7 @@ permissions:
   contents: read
 jobs:
   scan:
-    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@<pinned sha>
+    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@<full 40-char commit sha> # malware-scan-vN
 ```
 
 Each consumer must also vendor an identical `scripts/scan-injection.sh`; the

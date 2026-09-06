@@ -57,7 +57,11 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          PKG=$(jq -r '.version // empty' package.json)
+          # jq -j plus a sentinel: plain $( ) strips trailing newlines, so a
+          # manifest value of "1.2.3\n" would arrive as "1.2.3" and sail past
+          # the whitelist below instead of being reported. -j suppresses jq's
+          # own newline; the x sentinel preserves any the value really carries.
+          PKG=$(jq -j '.version // empty' package.json; printf 'x'); PKG=${PKG%x}
           if [ -z "$PKG" ]; then
             echo "::error file=package.json::package.json has no \"version\" field."
             exit 1

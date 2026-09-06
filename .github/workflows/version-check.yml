@@ -77,7 +77,13 @@ jobs:
           if ! jq -s -e --arg re "$SEMVER" \
                 'length == 1 and ((.[0].version // "") | test($re))' \
                 package.json >/dev/null 2>&1; then
-            FOUND=$(jq -s -r 'if length == 1 then (.[0].version // "<missing>") else "<\(length) JSON documents>" end' package.json 2>/dev/null | tr -d '\000' | head -c 60 || true)
+            # tojson, not the raw value: this branch exists to report a
+            # manifest we have just judged malformed, so the value is exactly
+            # the untrusted input. CR and LF survive `tr -d '\000'`, and a
+            # newline inside an ::error annotation starts a NEW workflow
+            # command — a version of "1.2\n::add-mask::x" would run as one.
+            # tojson renders it as a single escaped JSON string.
+            FOUND=$(jq -s -r 'if length == 1 then ((.[0].version // "<missing>") | tojson) else "<\(length) JSON documents>" end' package.json 2>/dev/null | tr -d '\000' | head -c 60 || true)
             echo "::error file=package.json::version is missing, malformed, or not valid SemVer 2.0.0 (saw: ${FOUND:-<unparseable>})."
             exit 1
           fi

@@ -34,7 +34,7 @@ permissions:
   contents: read
 jobs:
   scan:
-    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@<full 40-char commit sha> # malware-scan-vN
+    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@39ed211bd06d47dfd1d5011ba5f32f6b7e6c4a5d # malware-scan-v1
 ```
 
 Each consumer must also vendor an identical `scripts/scan-injection.sh`; the

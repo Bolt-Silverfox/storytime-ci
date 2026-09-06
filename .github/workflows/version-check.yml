@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so tag lookups and the base-ref diff both work.
           fetch-depth: 0
@@ -61,8 +61,12 @@ jobs:
             echo "::error file=package.json::package.json has no \"version\" field."
             exit 1
           fi
-          if ! printf '%s' "$PKG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "::error file=package.json::\"$PKG\" is not valid semver."
+          # Official SemVer 2.0.0 expression (semver.org). Accepts prerelease
+          # and build metadata together (1.2.3-rc.1+build.7) and rejects leading
+          # zeros in numeric identifiers (01.2.3).
+          SEMVER='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if ! printf '%s' "$PKG" | grep -Eq "$SEMVER"; then
+            echo "::error file=package.json::\"$PKG\" is not valid SemVer 2.0.0."
             exit 1
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -100,17 +104,13 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
-          TRACKED=""
-          for f in $VERSION_FILES; do
-            [ -f "$f" ] && TRACKED="$TRACKED $f"
-          done
-          if [ -z "$TRACKED" ]; then
-            echo "None of the version files exist here — skipping tag check."
-            exit 0
-          fi
+          # Pass every configured path straight to git rather than filtering by
+          # what exists in the working tree: a path missing on one side is
+          # exactly what a deletion looks like, and that still counts as a
+          # change to a version file. git ignores paths absent from both sides.
           # shellcheck disable=SC2086
-          if git diff --quiet "$BASE_SHA" -- $TRACKED; then
-            echo "This PR does not touch$TRACKED — not a version bump, skipping tag check."
+          if git diff --quiet "$BASE_SHA" -- $VERSION_FILES; then
+            echo "This PR does not touch $VERSION_FILES — not a version bump, skipping tag check."
             exit 0
           fi
           TAG="${TAG_PREFIX}${PKG}"

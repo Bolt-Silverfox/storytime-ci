@@ -1,0 +1,122 @@
+# Reusable version-consistency gate.
+#
+# Callers pin this by full 40-char commit SHA, exactly like malware-scan.yml.
+#
+# Two checks, both deliberately narrow so they only fire on real mistakes:
+#
+#   1. DRIFT (always) — if the repo has an Expo app.json, its expo.version must
+#      equal package.json version. This is the failure that let storytime-mobile
+#      ship 1.3.1 to TestFlight while package.json still said 1.3.0.
+#
+#   2. TAG REUSE (only when the PR changes the version) — if a PR bumps the
+#      version to something that is already tagged, release-tag.yml would find
+#      the tag present and silently skip, leaving the release untagged. A PR
+#      that does not touch the version is ignored, so ordinary changes are
+#      never blocked by this.
+name: version-check
+
+on:
+  workflow_call:
+    inputs:
+      version_files:
+        description: >-
+          Space-separated paths whose change marks a PR as a version bump.
+          Defaults cover npm + Expo layouts.
+        required: false
+        type: string
+        default: 'package.json app.json'
+      tag_prefix:
+        description: 'Prefix used by the release tags (v1.2.3 -> "v").'
+        required: false
+        type: string
+        default: 'v'
+
+permissions:
+  contents: read
+
+jobs:
+  version-consistency:
+    name: version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so tag lookups and the base-ref diff both work.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read declared versions
+        id: read
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "No package.json at the repo root — nothing to check."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PKG=$(jq -r '.version // empty' package.json)
+          if [ -z "$PKG" ]; then
+            echo "::error file=package.json::package.json has no \"version\" field."
+            exit 1
+          fi
+          if ! printf '%s' "$PKG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error file=package.json::\"$PKG\" is not valid semver."
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "package.json version: $PKG"
+
+      - name: Check app.json agrees with package.json
+        if: steps.read.outputs.skip != 'true'
+        env:
+          PKG: ${{ steps.read.outputs.pkg }}
+        run: |
+          set -euo pipefail
+          if [ ! -f app.json ]; then
+            echo "No app.json — drift check not applicable."
+            exit 0
+          fi
+          APP=$(jq -r '.expo.version // empty' app.json)
+          if [ -z "$APP" ]; then
+            echo "app.json has no expo.version — nothing to compare."
+            exit 0
+          fi
+          if [ "$APP" != "$PKG" ]; then
+            echo "::error file=app.json::Version drift: app.json expo.version is \"$APP\" but package.json is \"$PKG\". Expo builds take the version from app.json, while release tagging reads package.json — leaving these apart produces a released binary that no tag describes. Set both to the same value."
+            exit 1
+          fi
+          echo "app.json and package.json agree on $PKG."
+
+      - name: Check the version is not already tagged
+        # Only meaningful on a PR, and only when the PR actually moves the version.
+        if: steps.read.outputs.skip != 'true' && github.event_name == 'pull_request'
+        env:
+          PKG: ${{ steps.read.outputs.pkg }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          VERSION_FILES: ${{ inputs.version_files }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          TRACKED=""
+          for f in $VERSION_FILES; do
+            [ -f "$f" ] && TRACKED="$TRACKED $f"
+          done
+          if [ -z "$TRACKED" ]; then
+            echo "None of the version files exist here — skipping tag check."
+            exit 0
+          fi
+          # shellcheck disable=SC2086
+          if git diff --quiet "$BASE_SHA" -- $TRACKED; then
+            echo "This PR does not touch$TRACKED — not a version bump, skipping tag check."
+            exit 0
+          fi
+          TAG="${TAG_PREFIX}${PKG}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            EXISTING=$(git rev-list -n 1 "$TAG")
+            echo "::error::This PR sets the version to $PKG, but tag $TAG already exists (at ${EXISTING:0:8}). release-tag.yml skips when the tag is present, so merging this would leave the release untagged. Bump to an unreleased version instead."
+            exit 1
+          fi
+          echo "Version $PKG is not yet tagged as $TAG — good."

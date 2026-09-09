@@ -84,14 +84,16 @@ excluded automatically) and flags a file on **any** of:
 False positives (a genuinely minified/vendored *tracked* file) are cleared by
 adding its `sha256␠␠path` to `.ci-scan-allow.txt` **after review**.
 
-### Path handling (two bypasses found by review, both fixed)
+### Path and token handling (four bypasses found by review, all fixed)
 
-The checks above are only as good as the list of files they are applied to. Two
-ways of naming a file made the scan skip it *silently*, reporting `clean` and
-exiting 0 — verified against a real marker payload before the fix:
+The checks above are only as good as (a) the list of files they are applied to
+and (b) the assumption that a token sits on one physical line. Four ways of
+naming or formatting a file made the scan skip it *silently*, reporting `clean`
+and exiting 0 — each verified against a real marker payload before the fix, and
+each covered by a regression test in `tests/scan-injection.test.sh`:
 
 * **Non-ASCII / quoted paths.** `git ls-files` applies `core.quotePath` and
-  prints `café.js` as the 12-character string `"caf\303\251.js"`, quotes
+  prints `café.js` as the C-quoted string `"caf\303\251.js"`, quotes
   included. That names no file, so the `[ -f ]` guard skipped it. Both file
   lists are now read **NUL-delimited** (`git ls-files -z`,
   `git diff --cached -z`), which is never quoted or escaped and also handles a
@@ -100,10 +102,44 @@ exiting 0 — verified against a real marker payload before the fix:
   `-e` option: the regex became the *filename* and the payload was never read.
   Paths are now passed to external tools as `./-e.js`. (`--` alone was not used:
   `awk` and `shasum` handle it inconsistently across implementations.)
+* **Uppercase extensions.** bash `case` is case-sensitive and this script does
+  not set `nocasematch`, so `fa-solid-400.WOFF2` matched neither
+  `is_binary_asset` nor `asset_magic` — and `is_scan_target` lists no font/image
+  extensions either, so the file also fell out of checks 1–3. **No check examined
+  it at all**: capitalising one letter defeated the exact magic-byte comparison
+  that caught the live 2026-09 payload. All three classifiers are now fed a
+  lowercased copy of the path (`lc`), as is the `.vscode/` path match — on the
+  case-insensitive filesystems VS Code also runs on, `.VSCode/tasks.JSON` loads
+  just like `.vscode/tasks.json`. `nocasematch` was deliberately *not* used: it
+  is a global shell option that would silently change every unrelated `case` in
+  the script, including the argument parser and the magic-byte comparison.
+  `lc` uses `tr`, not `${var,,}`, because the latter is bash 4.0+ and this script
+  is bash 3.2-safe for the macOS pre-commit hook.
+* **Structural tokens split across lines.** `grep` is line-oriented, but the
+  payload's syntax is not: `global.i =` on one line and `"A8-…"` on the next is
+  valid JS, and `"runOn":` / `"folderOpen"` on two lines is valid JSONC. Both
+  were reported clean. Those greps now run through `grep_folded`, which matches
+  against the file with newlines folded to spaces, so the patterns' existing
+  `[[:space:]]*` spans cover a line break (and CRLF files, for free). This does
+  **not** broaden what matches: the value must still be *adjacent* to its
+  key/operator with only whitespace between, so `"runOn": "default"` followed by
+  a separate `"detail": "folderOpen"` still does not fire. Folding is a strict
+  superset of the per-line match, so it *replaces* the line-oriented greps rather
+  than adding a second parallel mechanism. The overlong-line rule in check 1 is
+  intentionally not folded — it is a statement about physical line length.
+  `grep_folded` counts with `grep -c` instead of `grep -q` for the same reason
+  check 1 does: under `pipefail`, `-q` closes the pipe early, `tr` dies of
+  SIGPIPE, and a real detection would be discarded as a miss.
 
 Findings are printed with `printf '%s'`, not `%b`, since the accumulated message
 now contains attacker-chosen paths and `%b` would expand backslash escapes in
-them.
+them. For the same reason every printed pathname goes through `render_path`: the
+findings block is written to a GitHub Actions step's stderr, which Actions parses
+line by line for workflow commands, so a tracked file named `::error::spoofed.js`
+or one with an embedded newline could forge annotations (it cannot hide the
+failure — the exit code is unaffected — but it can make the log lie about what was
+found). CR/LF are rendered as visible `\r`/`\n` escapes and every path is emitted
+behind a fixed `path=` prefix so it can never begin a line.
 
 Extension/magic-byte checking accepts **PNG magic for `.ico`**: shipping a bare
 PNG named `favicon.ico` is standard practice and every browser accepts it, so
@@ -137,10 +173,31 @@ repo before.
 3. Re-vendor the identical script to every other repo (a small PR each). Until a
    repo is re-vendored, its scan fails closed (drift) — intended.
 
-> The path-handling fixes above changed the script, so `SCAN_SCRIPT_SHA256` moved
-> to `5d6cdf43932b522e96305ef3d2846875582a9e080e6a3dc86871604381413419`. **Every
-> consumer repo needs re-vendoring**; until then its scan fails closed on drift,
-> which is the intended, visible failure mode rather than a silent weakening.
+> The path- and token-handling fixes above changed the script, so
+> `SCAN_SCRIPT_SHA256` moved to `c1ca12437fc31a62626b2d6d45432e018d08e94c4fb4239f2e8c9d1f1468656e`. **Every consumer repo needs
+> re-vendoring**; until then its scan fails closed on drift, which is the
+> intended, visible failure mode rather than a silent weakening.
+
+### Regression tests
+
+`tests/scan-injection.test.sh` runs the scanner against generated throwaway git
+repos. It takes the scanner path as its only argument, which is the point: aim it
+at the previous revision to prove a bypass really existed, and at the current one
+to prove it is closed.
+
+```bash
+tests/scan-injection.test.sh                       # current script
+git show <old-sha>:scripts/scan-injection.sh > /tmp/old.sh
+tests/scan-injection.test.sh /tmp/old.sh           # should FAIL the bypass cases
+```
+
+Every positive case is paired with a negative one — a genuine `Inter.WOFF2` and
+`Logo.PNG`, ordinary source containing `global.foo = "bar"` and split multi-line
+strings, an ordinary `tasks.json`. The negative cases carry equal weight: this
+scanner is a required check in ten repos, so a false positive is its own outage.
+Fixtures are generated at runtime and never committed — a committed fixture
+carrying a real marker would be a tracked file here and would (correctly) fail
+this repo's own scan.
 
 ## Rollout to another repo
 

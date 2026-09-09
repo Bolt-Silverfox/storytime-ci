@@ -43,6 +43,61 @@ MARKER_RE="global\['!'\]|A8-2503|global(\.[A-Za-z_\$][A-Za-z0-9_\$]*|\[[^]]{1,32
 
 ALLOW_FILE=".ci-scan-allow.txt"   # "sha256␠␠path" per line: reviewed minified/vendored files
 
+# Extension matching must be case-INSENSITIVE, and this was a TOTAL bypass, not a
+# partial one. bash `case` is case-sensitive unless `nocasematch` is set (this
+# script deliberately does not set it — a global shell option silently changes
+# every unrelated `case` in the file, including the mode parser and the magic-byte
+# comparison). So `fa-solid-400.WOFF2` matched neither is_binary_asset nor
+# asset_magic, and is_scan_target lists no font/image extensions either — the file
+# therefore fell out of check (4) AND was never picked up by checks (1)-(3), so NO
+# check examined it at all. Capitalising one letter defeated the exact magic-byte
+# comparison that caught the live 2026-09 payload. Verified before the fix.
+# Every classifier below is fed lc "$f" instead of "$f"; the real path is still
+# used for file access, so behaviour on a case-sensitive filesystem is unchanged.
+# `tr`, not `${f,,}`: parameter-expansion case conversion is bash 4.0+, and this
+# script is deliberately bash 3.2-safe (see the mapfile note below) because it also
+# runs as a pre-commit hook on stock macOS. The explicit A-Z/a-z ranges avoid
+# locale-dependent multibyte behaviour in [:upper:]/[:lower:].
+lc() {
+  # shellcheck disable=SC2018,SC2019  # ASCII-only is intentional: file extensions
+  # are ASCII, and [:upper:]/[:lower:] are locale-dependent for multibyte input.
+  printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+# Structural tokens split across physical lines evaded every grep below. All of
+# these checks inspected ONE physical line, yet the payload's own syntax does not
+# have to be on one line to run:
+#     global.i =
+#       "A8-2503#new"
+#   "runOn":
+#     "folderOpen"
+# Both are valid JS / JSONC and both were reported clean. So the greps now match
+# against a copy of the file with newlines folded to spaces, which lets the
+# patterns' existing [[:space:]]* spans cover a line break too.
+#
+# This does NOT over-broaden. The patterns still require the value to be ADJACENT
+# to its key/operator with nothing but whitespace between, so folding
+#     "runOn": "build",
+#     "label": "folderOpen"
+# gives `"runOn": "build", "label": "folderOpen"` — intervening text, no match.
+# Folding is a strict superset of the per-line match (a newline becomes a space,
+# which [[:space:]]* already accepted), so it REPLACES the line-oriented greps
+# rather than adding a second parallel mechanism. It also fixes CRLF files for
+# free. The overlong-line rule in check (1) is intentionally NOT folded: it is a
+# statement about physical line length.
+#
+# `grep -c` + count test, never `grep -q`: under `pipefail`, grep -q closes the
+# pipe on its first match, `tr` dies of SIGPIPE (141), and pipefail turns the whole
+# pipeline non-zero — so a REAL detection would be discarded as a miss. That trap
+# already bit this script once (see check (1)). Reading from a redirect rather
+# than passing a filename also makes this immune to option injection, so no
+# safe_path is needed here.
+grep_folded() {
+  local _hits
+  _hits=$(tr '\n' ' ' < "$2" | grep -caE -- "$1" || true)
+  [ "${_hits:-0}" -gt 0 ]
+}
+
 mode="all"
 case "${1:-}" in
   --staged) mode="staged" ;;
@@ -183,7 +238,30 @@ safe_path() {
   esac
 }
 
+# Output-only escaping for a pathname that is about to be PRINTED. git pathnames
+# are arbitrary bytes, and now that the file list is NUL-delimited they really can
+# contain LF and CR (that was the point of the -z fix). The findings block is
+# written to stderr of a GitHub Actions step, and Actions parses every LINE of it
+# for workflow commands — so a tracked file named
+#   $'x\n::error::spoofed'   or   '::error::spoofed.js'
+# could forge annotations or emit ::stop-commands:: to derail command processing.
+# It cannot hide the failure (the exit code is unaffected), but it can make the
+# log lie about WHAT was found, which is the part a human acts on. So CR/LF are
+# rendered as visible two-character escapes and every pathname is emitted behind a
+# fixed `path=` prefix, which also means an attacker-chosen name can never sit at
+# the start of a line where Actions would look for `::`.
+# One awk, not `sed 's/\r/…/'`: BSD sed (macOS, where the pre-commit hook runs)
+# does not understand \r in a regex and would match a literal "r", corrupting every
+# path containing that letter. CR is built with sprintf("%c", 13) rather than a
+# \r regex escape for the same portability reason.
+render_path() {
+  printf 'path=%s' "$(printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { cr = sprintf("%c", 13) }
+    { gsub(cr, "\\r"); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }')"
+}
+
 # Findings accumulate with REAL newlines and are printed with printf '%s', not
+# '%b'. Pathnames inside them go through render_path (above) first.
 # '%b'. '%b' expands backslash escapes in its argument, and the argument now
 # contains attacker-chosen file PATHS (the -z change above means paths with
 # backslashes actually reach here) — a file named 'x\u0041.js' would have been
@@ -194,7 +272,8 @@ bad=""
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue           # deleted/renamed away
   sf=$(safe_path "$f")
-  is_scan_target "$f" || continue
+  lf=$(lc "$f")                     # extension matching is case-insensitive
+  is_scan_target "$lf" || continue
   is_allowed "$f" && continue        # reviewed known-good minified/vendored file
 
   # (1) Obfuscated CODE blob: an overlong line that ALSO carries obfuscation /
@@ -209,19 +288,19 @@ for f in "${files[@]}"; do
   # Verified: on a large file with an early match the -q form returns 141.
   # (Dropping just the -q does not help — GNU grep optimises `>/dev/null` the
   # same way.) grep -c has to read every line to count, so it never early-exits.
-  if is_executable_code "$f"; then
+  if is_executable_code "$lf"; then
     long_hits=$(awk -v m="$MAX_LINE" 'length($0) > m' "$sf" \
       | grep -caE "_0x[0-9a-fA-F]{4,}|=[[:space:]]*require\(|String\.fromCharCode\(|eval\(|atob\(|Function\(" || true)
     if [ "${long_hits:-0}" -gt 0 ]; then
-      bad+="${f}: overlong obfuscated code line (blob payload)${nl}"
+      bad+="$(render_path "$f"): overlong obfuscated code line (blob payload)${nl}"
       continue
     fi
   fi
 
   # (2) Require-hijack / char-code obfuscation hallmarks anywhere (line length
   # independent — the stager's require shim/hijack may sit on short lines too).
-  if grep -qaE -- "global\[[^]]+\][[:space:]]*=[[:space:]]*require|global\.[A-Za-z_\$][A-Za-z0-9_\$]*[[:space:]]*=[[:space:]]*require|String\.fromCharCode\([^)]*,[^)]*,[^)]*,|(_0x[0-9a-fA-F]{4,}[^_]*){4,}" "$sf"; then
-    bad+="${f}: require-hijack / char-code / hex-identifier obfuscation${nl}"
+  if grep_folded "global\[[^]]+\][[:space:]]*=[[:space:]]*require|global\.[A-Za-z_\$][A-Za-z0-9_\$]*[[:space:]]*=[[:space:]]*require|String\.fromCharCode\([^)]*,[^)]*,[^)]*,|(_0x[0-9a-fA-F]{4,}[^_]*){4,}" "$f"; then
+    bad+="$(render_path "$f"): require-hijack / char-code / hex-identifier obfuscation${nl}"
     continue
   fi
 
@@ -231,8 +310,8 @@ for f in "${files[@]}"; do
   # global (dot OR bracket form). Requiring the "global<assignment>'A8-" shape
   # keeps it from firing on an ordinary string that happens to contain "A8-"
   # (a colour, a hash, an AWS instance type).
-  if grep -qaE -- "$MARKER_RE" "$sf"; then
-    bad+="${f}: known worm marker family${nl}"
+  if grep_folded "$MARKER_RE" "$f"; then
+    bad+="$(render_path "$f"): known worm marker family${nl}"
     continue
   fi
 done
@@ -249,10 +328,11 @@ done
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   sf=$(safe_path "$f")
-  is_binary_asset "$f" || continue
+  lf=$(lc "$f")                     # .WOFF2 must classify exactly like .woff2
+  is_binary_asset "$lf" || continue
   is_allowed "$f" && continue
 
-  if magic=$(asset_magic "$f"); then
+  if magic=$(asset_magic "$lf"); then
     head_hex=$(head -c 4 -- "$sf" | od -An -tx1 -v | tr -d ' \n')
     matched=no
     while IFS= read -r want; do
@@ -260,7 +340,7 @@ for f in "${files[@]}"; do
       case "$head_hex" in "$want"*) matched=yes; break ;; esac
     done < <(printf '%s\n' "$magic" | tr '|' '\n')
     if [ "$matched" = no ]; then
-      bad+="${f}: extension/magic-byte mismatch — expected ${magic}, got ${head_hex} (payload disguised as an asset)${nl}"
+      bad+="$(render_path "$f"): extension/magic-byte mismatch — expected ${magic}, got ${head_hex} (payload disguised as an asset)${nl}"
       continue
     fi
   fi
@@ -269,15 +349,15 @@ for f in "${files[@]}"; do
     desc=$(file -b -- "$sf" 2>/dev/null || true)
     case "$desc" in
       *JavaScript*|*"ASCII text"*|*"Unicode text"*|*"shell script"*|*"Python script"*|*"UTF-8 text"*)
-        bad+="${f}: binary asset that file(1) reports as text/code — \"${desc}\" (payload disguised as an asset)${nl}"
+        bad+="$(render_path "$f"): binary asset that file(1) reports as text/code — \"${desc}\" (payload disguised as an asset)${nl}"
         continue ;;
     esac
   fi
 
   # Keep the pre-existing content grep too: an asset with VALID magic bytes and
   # a payload appended after the real font data would pass both checks above.
-  if grep -qaE -- "$MARKER_RE|=[[:space:]]*require\(" "$sf"; then
-    bad+="${f}: worm marker / require-hijack inside a binary asset${nl}"
+  if grep_folded "$MARKER_RE|=[[:space:]]*require\(" "$f"; then
+    bad+="$(render_path "$f"): worm marker / require-hijack inside a binary asset${nl}"
     continue
   fi
 done
@@ -295,7 +375,10 @@ done
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   sf=$(safe_path "$f")
-  case "$f" in
+  # Lowercased: on the case-insensitive filesystems VS Code also runs on (macOS,
+  # Windows) `.VSCode/tasks.JSON` is loaded exactly like `.vscode/tasks.json`.
+  lf=$(lc "$f")
+  case "$lf" in
     .vscode/*.json|*/.vscode/*.json|*.code-workspace) ;;
     *) continue ;;
   esac
@@ -310,24 +393,24 @@ for f in "${files[@]}"; do
   # config has no reason to \u-escape ASCII; note this does NOT match "\\" , so
   # Windows paths like "C:\\tools" are unaffected.
   if grep -qaE -- '\\u[0-9a-fA-F]{4}' "$sf"; then
-    bad+="${f}: JSON unicode escape (backslash-u) in a VS Code config — unescape it so it can be reviewed literally (escapes can hide runOn/folderOpen from this scan)${nl}"
+    bad+="$(render_path "$f"): JSON unicode escape (backslash-u) in a VS Code config — unescape it so it can be reviewed literally (escapes can hide runOn/folderOpen from this scan)${nl}"
     continue
   fi
 
-  if grep -qaE -- '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$sf"; then
+  if grep_folded '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$f"; then
     detail="auto-running task (runOn: folderOpen)"
-    if grep -qaE -- '"hide"[[:space:]]*:[[:space:]]*true' "$sf"; then
+    if grep_folded '"hide"[[:space:]]*:[[:space:]]*true' "$f"; then
       detail="$detail, hidden from the task list"
     fi
-    if grep -qaE -- '"reveal"[[:space:]]*:[[:space:]]*"never"' "$sf"; then
+    if grep_folded '"reveal"[[:space:]]*:[[:space:]]*"never"' "$f"; then
       detail="$detail, output suppressed (reveal: never)"
     fi
-    bad+="${f}: ${detail}${nl}"
+    bad+="$(render_path "$f"): ${detail}${nl}"
     continue
   fi
 
-  if grep -qaE -- '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*"?(true|on)"?' "$sf"; then
-    bad+="${f}: automatic tasks pre-approved (task.allowAutomaticTasks) — removes VS Code's run-on-open prompt${nl}"
+  if grep_folded '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*"?(true|on)"?' "$f"; then
+    bad+="$(render_path "$f"): automatic tasks pre-approved (task.allowAutomaticTasks) — removes VS Code's run-on-open prompt${nl}"
     continue
   fi
 done

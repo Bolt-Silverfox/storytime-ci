@@ -22,7 +22,7 @@
 # extension, VS Code auto-execution config, and a marker check that matches the
 # A8- family generically rather than one literal string.
 #
-# Canonical source: Bolt-Silverfox/storytime_be:scripts/scan-injection.sh
+# Canonical source: Bolt-Silverfox/storytime-ci:scripts/scan-injection.sh
 # Vendored copies in other repos are hash-verified against this one in CI.
 #
 # Usage:
@@ -47,7 +47,8 @@ mode="all"
 case "${1:-}" in
   --staged) mode="staged" ;;
   ""|--all) mode="all" ;;
-  -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  # `sed 1d` drops the shebang, which would otherwise print as "!/usr/bin/env bash".
+  -h|--help) sed 1d "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) echo "unknown arg: $1" >&2; exit 2 ;;
 esac
 
@@ -61,13 +62,22 @@ fi
 # NOTE: no `mapfile` — it is bash 4+, and stock macOS still ships bash 3.2, where
 # the hook would abort (and under `set -u` the later "${files[@]}" expansion of an
 # unset array aborts too). A plain read loop is portable.
+#
+# `-z` (NUL-delimited) is REQUIRED, not a nicety. Without it git applies
+# core.quotePath and emits a non-ASCII path as a C-quoted string with the quotes
+# INCLUDED — `git ls-files` prints "caf\303\251.js" for café.js. That string
+# names no file, so the `[ -f "$f" ]` guard below skipped it and the payload was
+# never scanned, silently, with the run still reporting "clean". Verified: a
+# marker-carrying café.js and a disguised logó.woff2 both passed. NUL-delimited
+# output is never quoted or escaped, which also handles a path containing a
+# newline or a double quote. `read -d ''` is bash 3.2-safe (unlike mapfile -d).
 files=()
-while IFS= read -r _line; do
+while IFS= read -r -d '' _line; do
   files+=("$_line")
 done < <(if [ "$mode" = "staged" ]; then
-           git diff --cached --name-only --diff-filter=ACM
+           git diff --cached --name-only --diff-filter=ACM -z
          else
-           git ls-files
+           git ls-files -z
          fi)
 
 # Guard the empty case explicitly: on bash < 4.4, "${files[@]}" on an empty array
@@ -118,7 +128,13 @@ asset_magic() {
     *.png)   echo '89504e47' ;;
     *.gif)   echo '47494638' ;;
     *.jpg|*.jpeg) echo 'ffd8ff' ;;
-    *.ico)   echo '00000100|00000200' ;;
+    # .ico also accepts PNG magic on purpose. Shipping a bare PNG named
+    # favicon.ico is standard practice (every browser accepts it, and favicon
+    # generators / Next.js app/favicon.ico routinely emit one), so treating it
+    # as a mismatch was a false positive that would have failed CI in every
+    # consumer repo. A PNG is still a real image, and such a file remains
+    # covered by the file(1) text/code check and the marker grep below.
+    *.ico)   echo '00000100|00000200|89504e47' ;;
     *)       return 1 ;;
   esac
 }
@@ -134,10 +150,12 @@ is_binary_asset() {
 # macOS has no sha256sum; it ships `shasum`. Without this the allowlist silently
 # never matches on a Mac, so a reviewed false positive keeps blocking commits.
 sha256_of() {
+  local t
+  t=$(case "$1" in -*) printf './%s' "$1" ;; *) printf '%s' "$1" ;; esac)
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    sha256sum "$t" 2>/dev/null | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    shasum -a 256 "$t" 2>/dev/null | awk '{print $1}'
   else
     return 1
   fi
@@ -147,12 +165,35 @@ is_allowed() {
   [ -f "$ALLOW_FILE" ] || return 1
   local h
   h=$(sha256_of "$1") || return 1
-  [ -n "$h" ] && grep -qE "^${h}[[:space:]]" "$ALLOW_FILE"
+  [ -n "$h" ] && grep -qE -- "^${h}[[:space:]]" "$ALLOW_FILE"
 }
 
+# Option-injection guard. A tracked path that begins with "-" is parsed by every
+# downstream tool as an OPTION, not a file. This was a complete bypass, not a
+# cosmetic issue: a file named `-e.js` carrying the live marker made grep read
+# `-e` as its pattern flag and the regex as the filename, so the scan printed
+# "clean" and exited 0. Verified before the fix. `--` alone is not enough (awk
+# and shasum handle it inconsistently across implementations), so paths are
+# passed as `./-e.js`, which no tool can mistake for an option. git only ever
+# emits repo-relative paths here, so prefixing is always valid.
+safe_path() {
+  case "$1" in
+    -*) printf './%s' "$1" ;;
+    *)  printf '%s' "$1" ;;
+  esac
+}
+
+# Findings accumulate with REAL newlines and are printed with printf '%s', not
+# '%b'. '%b' expands backslash escapes in its argument, and the argument now
+# contains attacker-chosen file PATHS (the -z change above means paths with
+# backslashes actually reach here) — a file named 'x\u0041.js' would have been
+# mangled, and printf warns on a malformed escape. '%s' prints paths verbatim.
+nl='
+'
 bad=""
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue           # deleted/renamed away
+  sf=$(safe_path "$f")
   is_scan_target "$f" || continue
   is_allowed "$f" && continue        # reviewed known-good minified/vendored file
 
@@ -169,18 +210,18 @@ for f in "${files[@]}"; do
   # (Dropping just the -q does not help — GNU grep optimises `>/dev/null` the
   # same way.) grep -c has to read every line to count, so it never early-exits.
   if is_executable_code "$f"; then
-    long_hits=$(awk -v m="$MAX_LINE" 'length($0) > m' "$f" \
+    long_hits=$(awk -v m="$MAX_LINE" 'length($0) > m' "$sf" \
       | grep -caE "_0x[0-9a-fA-F]{4,}|=[[:space:]]*require\(|String\.fromCharCode\(|eval\(|atob\(|Function\(" || true)
     if [ "${long_hits:-0}" -gt 0 ]; then
-      bad+="${f}: overlong obfuscated code line (blob payload)\n"
+      bad+="${f}: overlong obfuscated code line (blob payload)${nl}"
       continue
     fi
   fi
 
   # (2) Require-hijack / char-code obfuscation hallmarks anywhere (line length
   # independent — the stager's require shim/hijack may sit on short lines too).
-  if grep -qE "global\[[^]]+\][[:space:]]*=[[:space:]]*require|global\.[A-Za-z_\$][A-Za-z0-9_\$]*[[:space:]]*=[[:space:]]*require|String\.fromCharCode\([^)]*,[^)]*,[^)]*,|(_0x[0-9a-fA-F]{4,}[^_]*){4,}" "$f"; then
-    bad+="${f}: require-hijack / char-code / hex-identifier obfuscation\n"
+  if grep -qaE -- "global\[[^]]+\][[:space:]]*=[[:space:]]*require|global\.[A-Za-z_\$][A-Za-z0-9_\$]*[[:space:]]*=[[:space:]]*require|String\.fromCharCode\([^)]*,[^)]*,[^)]*,|(_0x[0-9a-fA-F]{4,}[^_]*){4,}" "$sf"; then
+    bad+="${f}: require-hijack / char-code / hex-identifier obfuscation${nl}"
     continue
   fi
 
@@ -190,8 +231,8 @@ for f in "${files[@]}"; do
   # global (dot OR bracket form). Requiring the "global<assignment>'A8-" shape
   # keeps it from firing on an ordinary string that happens to contain "A8-"
   # (a colour, a hash, an AWS instance type).
-  if grep -qaE "$MARKER_RE" "$f"; then
-    bad+="${f}: known worm marker family\n"
+  if grep -qaE -- "$MARKER_RE" "$sf"; then
+    bad+="${f}: known worm marker family${nl}"
     continue
   fi
 done
@@ -207,35 +248,36 @@ done
 # ---------------------------------------------------------------------------
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
+  sf=$(safe_path "$f")
   is_binary_asset "$f" || continue
   is_allowed "$f" && continue
 
   if magic=$(asset_magic "$f"); then
-    head_hex=$(head -c 4 "$f" | od -An -tx1 -v | tr -d ' \n')
+    head_hex=$(head -c 4 -- "$sf" | od -An -tx1 -v | tr -d ' \n')
     matched=no
     while IFS= read -r want; do
       [ -n "$want" ] || continue
       case "$head_hex" in "$want"*) matched=yes; break ;; esac
     done < <(printf '%s\n' "$magic" | tr '|' '\n')
     if [ "$matched" = no ]; then
-      bad+="${f}: extension/magic-byte mismatch — expected ${magic}, got ${head_hex} (payload disguised as an asset)\n"
+      bad+="${f}: extension/magic-byte mismatch — expected ${magic}, got ${head_hex} (payload disguised as an asset)${nl}"
       continue
     fi
   fi
 
   if command -v file >/dev/null 2>&1; then
-    desc=$(file -b "$f" 2>/dev/null || true)
+    desc=$(file -b -- "$sf" 2>/dev/null || true)
     case "$desc" in
       *JavaScript*|*"ASCII text"*|*"Unicode text"*|*"shell script"*|*"Python script"*|*"UTF-8 text"*)
-        bad+="${f}: binary asset that file(1) reports as text/code — \"${desc}\" (payload disguised as an asset)\n"
+        bad+="${f}: binary asset that file(1) reports as text/code — \"${desc}\" (payload disguised as an asset)${nl}"
         continue ;;
     esac
   fi
 
   # Keep the pre-existing content grep too: an asset with VALID magic bytes and
   # a payload appended after the real font data would pass both checks above.
-  if grep -qaE "$MARKER_RE|=[[:space:]]*require\(" "$f"; then
-    bad+="${f}: worm marker / require-hijack inside a binary asset\n"
+  if grep -qaE -- "$MARKER_RE|=[[:space:]]*require\(" "$sf"; then
+    bad+="${f}: worm marker / require-hijack inside a binary asset${nl}"
     continue
   fi
 done
@@ -252,6 +294,7 @@ done
 # ---------------------------------------------------------------------------
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
+  sf=$(safe_path "$f")
   case "$f" in
     .vscode/*.json|*/.vscode/*.json|*.code-workspace) ;;
     *) continue ;;
@@ -266,35 +309,32 @@ for f in "${files[@]}"; do
   # script cannot assume — it also runs as a pre-commit hook). Legitimate VS Code
   # config has no reason to \u-escape ASCII; note this does NOT match "\\" , so
   # Windows paths like "C:\\tools" are unaffected.
-  if grep -qE '\\u[0-9a-fA-F]{4}' "$f"; then
-    # NOTE: findings are emitted with printf '%b', so the message must not
-    # contain a literal backslash-u — printf would try to expand it as a unicode
-    # escape and warn "missing unicode digit". Spell it out in words instead.
-    bad+="${f}: JSON unicode escape (backslash-u) in a VS Code config — unescape it so it can be reviewed literally (escapes can hide runOn/folderOpen from this scan)\n"
+  if grep -qaE -- '\\u[0-9a-fA-F]{4}' "$sf"; then
+    bad+="${f}: JSON unicode escape (backslash-u) in a VS Code config — unescape it so it can be reviewed literally (escapes can hide runOn/folderOpen from this scan)${nl}"
     continue
   fi
 
-  if grep -qE '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$f"; then
+  if grep -qaE -- '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$sf"; then
     detail="auto-running task (runOn: folderOpen)"
-    if grep -qE '"hide"[[:space:]]*:[[:space:]]*true' "$f"; then
+    if grep -qaE -- '"hide"[[:space:]]*:[[:space:]]*true' "$sf"; then
       detail="$detail, hidden from the task list"
     fi
-    if grep -qE '"reveal"[[:space:]]*:[[:space:]]*"never"' "$f"; then
+    if grep -qaE -- '"reveal"[[:space:]]*:[[:space:]]*"never"' "$sf"; then
       detail="$detail, output suppressed (reveal: never)"
     fi
-    bad+="${f}: ${detail}\n"
+    bad+="${f}: ${detail}${nl}"
     continue
   fi
 
-  if grep -qE '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*"?(true|on)"?' "$f"; then
-    bad+="${f}: automatic tasks pre-approved (task.allowAutomaticTasks) — removes VS Code's run-on-open prompt\n"
+  if grep -qaE -- '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*"?(true|on)"?' "$sf"; then
+    bad+="${f}: automatic tasks pre-approved (task.allowAutomaticTasks) — removes VS Code's run-on-open prompt${nl}"
     continue
   fi
 done
 
 if [ -n "$bad" ]; then
   echo "::error::Config-injection indicators found ($([ "$mode" = staged ] && echo staged || echo tracked) scan):" >&2
-  printf '%b' "$bad" >&2
+  printf '%s' "$bad" >&2
   echo "If a flagged file is a legitimate minified/vendored asset, add its 'sha256  path' to ${ALLOW_FILE} after review." >&2
   exit 1
 fi

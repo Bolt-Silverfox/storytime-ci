@@ -13,7 +13,7 @@ marker-agnostic** — it detects the injection *structurally*.
 |---|---|---|
 | `scripts/scan-injection.sh` | every repo (identical, hash-pinned) | The detector. Scans git-tracked files. |
 | `.githooks/pre-commit` | every repo | Local early-warning (scans staged files). Bypassable. |
-| `.github/workflows/malware-scan.yml` | `storytime_be` (canonical, reusable) | CI gate + weekly deep scan. Other repos call it. |
+| `.github/workflows/malware-scan.yml` | `storytime-ci` (canonical, reusable) | CI gate + weekly deep scan. Other repos call it. |
 | thin caller workflow | every other repo | 5 lines; invokes the reusable workflow. |
 | branch protection | GitHub settings (owner) | Makes the CI scan **required** → merge-blocking. |
 
@@ -84,6 +84,33 @@ excluded automatically) and flags a file on **any** of:
 False positives (a genuinely minified/vendored *tracked* file) are cleared by
 adding its `sha256␠␠path` to `.ci-scan-allow.txt` **after review**.
 
+### Path handling (two bypasses found by review, both fixed)
+
+The checks above are only as good as the list of files they are applied to. Two
+ways of naming a file made the scan skip it *silently*, reporting `clean` and
+exiting 0 — verified against a real marker payload before the fix:
+
+* **Non-ASCII / quoted paths.** `git ls-files` applies `core.quotePath` and
+  prints `café.js` as the 12-character string `"caf\303\251.js"`, quotes
+  included. That names no file, so the `[ -f ]` guard skipped it. Both file
+  lists are now read **NUL-delimited** (`git ls-files -z`,
+  `git diff --cached -z`), which is never quoted or escaped and also handles a
+  path containing a newline or a double quote.
+* **Paths beginning with `-`.** A file named `-e.js` was parsed by `grep` as the
+  `-e` option: the regex became the *filename* and the payload was never read.
+  Paths are now passed to external tools as `./-e.js`. (`--` alone was not used:
+  `awk` and `shasum` handle it inconsistently across implementations.)
+
+Findings are printed with `printf '%s'`, not `%b`, since the accumulated message
+now contains attacker-chosen paths and `%b` would expand backslash escapes in
+them.
+
+Extension/magic-byte checking accepts **PNG magic for `.ico`**: shipping a bare
+PNG named `favicon.ico` is standard practice and every browser accepts it, so
+rejecting it was a false positive that would have failed CI in every consumer
+repo. Such a file is still a real image, and remains covered by the `file(1)`
+text/code check and the marker grep.
+
 ## Enable the local hook (one-time, per clone)
 
 ```bash
@@ -103,12 +130,17 @@ repo before.
 
 ### Updating the detector
 
-1. Edit `scripts/scan-injection.sh` in `storytime_be`.
+1. Edit `scripts/scan-injection.sh` in `storytime-ci` (the canonical home — the workflow header says so, and this repo exists precisely so a history rewrite elsewhere cannot orphan it).
 2. In the **same PR**, bump `SCAN_SCRIPT_SHA256` in
    `.github/workflows/malware-scan.yml` to the new
    `sha256sum scripts/scan-injection.sh`.
 3. Re-vendor the identical script to every other repo (a small PR each). Until a
    repo is re-vendored, its scan fails closed (drift) — intended.
+
+> The path-handling fixes above changed the script, so `SCAN_SCRIPT_SHA256` moved
+> to `5d6cdf43932b522e96305ef3d2846875582a9e080e6a3dc86871604381413419`. **Every
+> consumer repo needs re-vendoring**; until then its scan fails closed on drift,
+> which is the intended, visible failure mode rather than a silent weakening.
 
 ## Rollout to another repo
 

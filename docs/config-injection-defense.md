@@ -17,6 +17,33 @@ marker-agnostic** — it detects the injection *structurally*.
 | thin caller workflow | every other repo | 5 lines; invokes the reusable workflow. |
 | branch protection | GitHub settings (owner) | Makes the CI scan **required** → merge-blocking. |
 
+## The 2026-09 variant (why checks 4 and 5 exist)
+
+Found live on `main` of the public repo `Bolt-Silverfox/storytime-devops`. It put
+nothing in a config file at all, so checks 1–3 as they stood could not see it:
+
+* **Payload**: `public/fonts/fa-solid-400.woff2` — 31,303 bytes of JavaScript.
+  Leading bytes `20202020` (four spaces), not `wOF2`; `file(1)` reports
+  "JavaScript source"; marker `global.i="A8-*#new"`; uses `spawn`. It was the
+  only `fa-solid-400.*` file in a directory where every other font family ships
+  five formats.
+* **Trigger**: a `.vscode/tasks.json` task labelled `eslint-check` with
+  `"hide": true`, `"reveal": "never"` and `"runOn": "folderOpen"`, running
+  `node ./public/fonts/fa-solid-400.woff2` on folder open — with
+  `"task.allowAutomaticTasks": true` in `.vscode/settings.json` so VS Code never
+  prompted.
+* **Delivery**: split across two commits months apart — the trigger in
+  `fdf5255d`, whose title claimed to *delete* `ansible/group_vars/staging.yml`
+  while quietly adding `.vscode/*` and `public/fonts/*`, and the payload blob in
+  `70f065de`. Neither half looks malicious alone.
+
+An EVM-based C2 was reported for this family; the payload here is obfuscated and
+that was **not** confirmed from strings, so it is not claimed as fact. The
+disguise, the hidden auto-run trigger, the marker and `spawn` are confirmed.
+
+Root cause of the miss: **marker-string matching**. Hence checks 4 and 5 are
+structural.
+
 ## How detection works (no filename list, no single marker)
 
 `scan-injection.sh` walks `git ls-files` (so `node_modules`/build output are
@@ -28,7 +55,31 @@ excluded automatically) and flags a file on **any** of:
 2. **Require-hijack / obfuscation hallmarks** — `global[...]=require`,
    `global.X=require`, `String.fromCharCode(`, dense `_0x…` hex identifiers.
    Grepped in **all** scanned files (code + json + vue/svelte).
-3. **Known marker families** — `global['!']`, `A8-2503` (cheap fast-path).
+3. **Known marker families** — `global['!']`, `A8-2503`, and the `A8-` campaign
+   tag generically wherever it is *assigned to a global* (`global.x = "A8-…"` or
+   `global['x'] = "A8-…"`). Not one literal string: the 2026-09 variant mutated
+   `global['!']` into `global.i="A8-*#new"` and so matched nothing. Requiring the
+   "assigned to a global" shape keeps it from firing on an ordinary string that
+   merely contains `A8-` (a SKU, a ticket id, an instance type).
+4. **Disguised binary assets** — any `.woff2`/`.woff`/`.ttf`/`.otf`/`.png`/
+   `.gif`/`.jpg`/`.ico` whose leading bytes contradict its extension, plus any
+   of those (and `.eot`, which has no stable signature) that `file(1)` reports
+   as text/JavaScript/script. **This is marker-free**: a `.woff2` that does not
+   begin with `wOF2` is not a font whatever it contains. The same marker /
+   `=require(` grep still runs over these assets, to catch a payload appended
+   *after* valid font data.
+5. **VS Code auto-execution** — `runOn: folderOpen` in any `.vscode/*.json` or
+   `*.code-workspace` (flagged harder when combined with `hide: true` /
+   `reveal: never`), and `"task.allowAutomaticTasks": true`, which removes VS
+   Code's run-on-open prompt. Grep-based on purpose: `tasks.json` is JSONC
+   (comments and trailing commas), so `jq` cannot parse it — the live malicious
+   file had a trailing comma. Because those greps are literal, any `\uXXXX`
+   escape in one of these files is rejected outright: JSON lets a property name
+   or value be written `"run\u004fn": "folder\u004fpen"`, VS Code decodes it
+   before use, and no literal grep could see it. In JSON the only way to write an
+   ASCII alphanumeric other than literally is `\uXXXX`, so rejecting the escape
+   closes the whole class without needing a JSONC parser. `"\\"` is not matched,
+   so Windows paths are unaffected.
 
 False positives (a genuinely minified/vendored *tracked* file) are cleared by
 adding its `sha256␠␠path` to `.ci-scan-allow.txt` **after review**.

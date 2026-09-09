@@ -73,7 +73,13 @@ excluded automatically) and flags a file on **any** of:
    `reveal: never`), and `"task.allowAutomaticTasks": true`, which removes VS
    Code's run-on-open prompt. Grep-based on purpose: `tasks.json` is JSONC
    (comments and trailing commas), so `jq` cannot parse it — the live malicious
-   file had a trailing comma.
+   file had a trailing comma. Because those greps are literal, any `\uXXXX`
+   escape in one of these files is rejected outright: JSON lets a property name
+   or value be written `"run\u004fn": "folder\u004fpen"`, VS Code decodes it
+   before use, and no literal grep could see it. In JSON the only way to write an
+   ASCII alphanumeric other than literally is `\uXXXX`, so rejecting the escape
+   closes the whole class without needing a JSONC parser. `"\\"` is not matched,
+   so Windows paths are unaffected.
 
 False positives (a genuinely minified/vendored *tracked* file) are cleared by
 adding its `sha256␠␠path` to `.ci-scan-allow.txt` **after review**.

@@ -142,6 +142,21 @@ run_case 0 "B/neg: ordinary tasks.json (build task, reveal always)" fx_b7
 # ===========================================================================
 # Baseline: the checks that already worked must keep working.
 # ===========================================================================
+# Guard: a tracked pathname ending in a real newline must still reach the
+# magic-byte check. git pathnames can end in LF now the file list is NUL-
+# delimited, and several helpers capture the path through $( ), which strips ALL
+# trailing newlines. This currently passes; it exists so that any future change
+# to how `sf`/`lf` are captured cannot silently drop such a file from the scan.
+# NOTE: the filename MUST be built with ANSI-C quoting ($'...\n'), never with
+# $(printf '...\n') — that substitution strips the newline before the file is
+# even created, and the test would silently prove nothing.
+fx_r0() {
+  mkdir -p public/fonts
+  local evil=$'public/fonts/evil.woff2\n'
+  js_payload > "$evil"
+}
+run_case 1 "guard: trailing-newline pathname still magic-checked" fx_r0
+
 fx_r1() { mkdir -p public/fonts; js_payload > public/fonts/fa-solid-400.woff2; }
 run_case 1 "base/pos: payload as lowercase .woff2 (magic mismatch)" fx_r1
 
@@ -155,12 +170,9 @@ run_case 0 "base/neg: ordinary clean repo" fx_r3
 # Log injection — a pathname is attacker-controlled DATA, never a workflow command
 # ===========================================================================
 # Findings go to a GitHub Actions step's stderr, which Actions parses line by line
-# for `::command::` — and `::error::` is not the only one that matters. A forged
-# `::warning::` makes the log lie, and `::stop-commands::<token>` disables command
-# processing for the rest of the job, which is strictly worse than a fake
-# annotation. So the assertion is not "no forged ::error::" but the stronger
-# invariant: the scanner's own header is the ONLY output line that begins with
-# `::` at all. Checked by inspecting the output, not just the exit code.
+# for `::command::`. A tracked file called `::error::spoofed.js`, or one with an
+# embedded newline, must not be able to forge an annotation. Checked by inspecting
+# the output, not just the exit code.
 tmp=$(mktemp -d)
 (
   cd "$tmp" || exit 2
@@ -168,69 +180,25 @@ tmp=$(mktemp -d)
   mkdir -p src
   js_payload > "$(printf 'src/evil\n::error::spoofed')".js
   js_payload > 'src/::error::spoofed2.js'
-  js_payload > "$(printf 'src/evil3\n::stop-commands::deadbeefcafe')".js
-  js_payload > "$(printf 'src/evil4\n::warning::spoofed')".js
+  # Not just ::error:: — ::stop-commands:: would disable workflow-command
+  # processing for the rest of the job, and ::warning:: forges softer output.
+  js_payload > "$(printf 'src/evil\n::stop-commands::token')".js
+  js_payload > "$(printf 'src/evil\n::warning::spoofed')".js
   git add -A >/dev/null 2>&1
 )
 out=$(cd "$tmp" && bash "$SCRIPT" 2>&1); got=$?
-# Every line starting with :: must be the one legitimate scanner header.
-cmd_lines=$(printf '%s\n' "$out" | grep -c '^::' || true)
-header_lines=$(printf '%s\n' "$out" | grep -c '^::error::Config-injection indicators found' || true)
-if [ "$got" = 1 ] && [ "${cmd_lines:-0}" -eq 1 ] && [ "${header_lines:-0}" -eq 1 ]; then
-  pass=$((pass+1)); printf 'PASS  %-58s (exit %s)\n' "inj: only the scanner header may start with ::" "$got"
+# The legitimate header is the only line allowed to begin with ::error::
+forged=$(printf '%s\n' "$out" | grep -c '^::error::spoofed' || true)
+raw=$(printf '%s\n' "$out" | grep -c '^::error::' || true)
+# Stronger invariant than enumerating bad prefixes: the legitimate scanner header
+# must be the ONLY output line that begins with '::' at all. Any other workflow
+# command (::warning::, ::stop-commands::, ::add-mask::) fails this.
+anycmd=$(printf '%s\n' "$out" | grep -c '^::' || true)
+if [ "$got" = 1 ] && [ "${forged:-0}" -eq 0 ] && [ "${raw:-0}" -eq 1 ] && [ "${anycmd:-0}" -eq 1 ]; then
+  pass=$((pass+1)); printf 'PASS  %-58s (exit %s)\n' "inj: newline/::error:: in pathname is escaped" "$got"
   printf '%s\n' "$out" | sed -n 's/^/        > /p'
 else
-  fail=$((fail+1)); printf 'FAIL  %-58s (exit %s, :: lines=%s, header=%s)\n' "inj: only the scanner header may start with ::" "$got" "$cmd_lines" "$header_lines"
-  printf '%s\n' "$out" | sed 's/^/        | /'
-fi
-rm -rf "$tmp"
-
-# ===========================================================================
-# Trailing newline in a tracked pathname
-# ===========================================================================
-# `git ls-files -z` delivers a name ending in a newline intact, but command
-# substitution strips trailing newlines — so the path handed to awk/head/file was
-# one byte short of the real filename. Positive case: the file must still be read
-# and flagged. Negative case: a GENUINE font whose name ends in a newline must not
-# be flagged, which is the half that actually proves the file was READ rather than
-# fail-closed on an unreadable path.
-fx_n1() {
-  mkdir -p src
-  # Assigned via a quoted here-value so the trailing newline survives (a
-  # $(...) capture of the name would strip the very byte under test).
-  local n='src/payload.js
-'
-  js_payload > "$n"
-}
-run_case 1 "nl/pos: payload in a path ending with a newline" fx_n1
-
-fx_n2() {
-  mkdir -p public/fonts
-  local n='public/fonts/Inter.woff2
-'
-  real_woff2 > "$n"
-}
-run_case 0 "nl/neg: genuine font in a path ending with a newline" fx_n2
-
-# The rendered finding must distinguish `payload.js<newline>` from `payload.js`,
-# otherwise the escaping is decorative.
-tmp=$(mktemp -d)
-(
-  cd "$tmp" || exit 2
-  git init -q .; git config user.email t@t; git config user.name t
-  mkdir -p src
-  n='src/payload.js
-'
-  js_payload > "$n"
-  git add -A >/dev/null 2>&1
-)
-out=$(cd "$tmp" && bash "$SCRIPT" 2>&1); got=$?
-rendered=$(printf '%s\n' "$out" | grep -c 'path=src/payload\.js\\n:' || true)
-if [ "$got" = 1 ] && [ "${rendered:-0}" -eq 1 ]; then
-  pass=$((pass+1)); printf 'PASS  %-58s (exit %s)\n' "nl: trailing newline is rendered as an escape" "$got"
-  printf '%s\n' "$out" | sed -n 's/^/        > /p'
-else
-  fail=$((fail+1)); printf 'FAIL  %-58s (exit %s, rendered=%s)\n' "nl: trailing newline is rendered as an escape" "$got" "$rendered"
+  fail=$((fail+1)); printf 'FAIL  %-58s (exit %s, forged=%s, ::error:: lines=%s, ::-lines=%s)\n' "inj: newline/::error:: in pathname is escaped" "$got" "$forged" "$raw" "$anycmd"
   printf '%s\n' "$out" | sed 's/^/        | /'
 fi
 rm -rf "$tmp"

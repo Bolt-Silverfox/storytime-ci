@@ -46,8 +46,19 @@ That pinned line is the **entire** integration: the reusable workflow checks
 `scripts/scan-injection.sh` out of this repo at run time, so consumers vendor no
 script and carry no checksum. See `docs/config-injection-defense.md`.
 
-Take `<40-char-sha>` from `git rev-parse origin/main` (or the tag's commit) at the
-time you add the caller. It must be a commit **at or after** the change that
+Take `<40-char-sha>` from **this** repository, not from the repo you are adding
+the caller to:
+
+```bash
+git ls-remote https://github.com/Bolt-Silverfox/storytime-ci.git refs/heads/main
+```
+
+Use the full 40-char SHA it prints. `git rev-parse origin/main` is wrong here —
+run inside a consumer repo (where you are while adding the caller) it returns
+that repo's own `main`, which does not exist in `storytime-ci`, so the `uses:`
+reference fails to resolve.
+
+The SHA must also be a commit **at or after** the change that
 removed the vendored-script requirement — earlier pins, including
 `39ed211bd06d47dfd1d5011ba5f32f6b7e6c4a5d` (`malware-scan-v1`), run the old
 workflow, which requires a caller-local `scripts/scan-injection.sh` and fails the

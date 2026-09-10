@@ -196,10 +196,14 @@ Then `bash .storytime-ci/scripts/scan-injection.sh` runs with the working
 directory still at `$GITHUB_WORKSPACE`. That distinction matters: the scanner
 picks its files from `git ls-files` of the repo it is *run in*, so it scans the
 caller and **not** `storytime-ci`. A nested clone is untracked in the outer repo,
-so nothing under `.storytime-ci/` is ever scanned — which also means this repo's
-own scanner and docs cannot self-flag (that has caused false positives here
-before). Verified in a real run: `git ls-files` listed 8 caller paths and zero
-under `.storytime-ci/`.
+so nothing under `.storytime-ci/` is ever scanned, and a consumer's scan therefore
+cannot be tripped by this repo's own scanner or fixtures (which has caused false
+positives before). Verified in a real run: `git ls-files` listed 8 caller paths and
+zero under `.storytime-ci/`. Note this says nothing about `storytime-ci`'s *own*
+run: there the first checkout is this repo, so its tracked files are scanned like
+any other consumer's — as they should be. Nothing here trips a check today because
+the scan targets are code/config/data extensions and this repo tracks only `.sh`,
+`.md` and `.yml`.
 
 If that checkout fails or the script is absent, the job **fails closed** with an
 actionable annotation before the scan step. A malware scan that quietly does
@@ -233,6 +237,20 @@ leaving consumers on the old detector. The workflow therefore has a self-check
 step, gated to `github.repository == 'Bolt-Silverfox/storytime-ci'` (skipped in
 every consumer), that fails if `scripts/scan-injection.sh` at HEAD is not
 byte-identical to the copy at `SCANNER_REF`.
+
+A byte comparison cannot see the *other* way it rots, though: a squash or rebase
+merge of a bump PR keeps commit 1's **content** on `main` under a new SHA, so
+`cmp` still passes while the SHA `SCANNER_REF` names is orphaned. GitHub keeps
+serving unreachable objects until they are collected, so consumers stay green and
+then break later for no visible reason — the shape of the 2026-09 outage. A second
+self-check step (also `storytime-ci` only) therefore asserts reachability
+directly: `SCANNER_REF` must be an ancestor of `main`, or of the current commit
+while a bump branch is still open. It deliberately does **not** accept "some
+branch contains it" — with `delete_branch_on_merge` off, a squashed PR's branch
+survives and would satisfy that, which was verified against a simulated squash
+merge. Belt and braces only: the real fix is restricting the `main` ruleset's
+`allowed_merge_methods` to `["merge"]`, which is an owner action (it is currently
+`["merge", "squash", "rebase"]`).
 
 ### Updating the detector
 

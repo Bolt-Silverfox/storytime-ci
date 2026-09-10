@@ -10,9 +10,10 @@ history rewrite in an application repo** (that happened in storytime_be in
 - Never force-push or rewrite history here.
 - Every change is a PR. When `scripts/scan-injection.sh` changes: push that
   commit, then bump `SCANNER_REF` in `.github/workflows/malware-scan.yml` to it
-  in a **second commit**, and **merge — never squash** (a squash orphans the SHA
-  that `SCANNER_REF` names). A self-check step in the workflow fails the build if
-  you skip the bump.
+  in a **second commit**, and land it with a **merge commit — never squash or
+  rebase** (either rewrites that commit, orphaning the SHA `SCANNER_REF` names).
+  Two self-check steps in the workflow fail the build if you skip the bump or if
+  `SCANNER_REF` stops being reachable from `main`.
 - Land changes with **"Create a merge commit"** only. Squash and rebase rewrite
   commit SHAs, which orphans anything pinned to them (`SCANNER_REF` here, and the
   consumers' `uses:` pins).
@@ -50,16 +51,17 @@ Take `<40-char-sha>` from **this** repository, not from the repo you are adding
 the caller to:
 
 ```bash
-git ls-remote https://github.com/Bolt-Silverfox/storytime-ci.git refs/heads/main
+git ls-remote https://github.com/Bolt-Silverfox/storytime-ci.git refs/heads/main | cut -f1
 ```
 
-Use the full 40-char SHA it prints. `git rev-parse origin/main` is wrong here —
+That prints the full 40-char SHA and nothing else (without `cut -f1` the ref name
+follows it after a tab). `git rev-parse origin/main` is wrong here —
 run inside a consumer repo (where you are while adding the caller) it returns
 that repo's own `main`, which does not exist in `storytime-ci`, so the `uses:`
 reference fails to resolve.
 
-The SHA must also be a commit **at or after** the change that
-removed the vendored-script requirement — earlier pins, including
+The SHA must also be a commit **at or after** the change that removed the
+vendored-script requirement — earlier pins, including
 `39ed211bd06d47dfd1d5011ba5f32f6b7e6c4a5d` (`malware-scan-v1`), run the old
 workflow, which requires a caller-local `scripts/scan-injection.sh` and fails the
 checksum gate without one.

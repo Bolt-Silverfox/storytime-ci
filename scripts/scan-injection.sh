@@ -206,7 +206,7 @@ is_binary_asset() {
 # never matches on a Mac, so a reviewed false positive keeps blocking commits.
 sha256_of() {
   local t
-  t=$(case "$1" in -*) printf './%s' "$1" ;; *) printf '%s' "$1" ;; esac)
+  capture t safe_path "$1"
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$t" 2>/dev/null | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
@@ -238,6 +238,22 @@ safe_path() {
   esac
 }
 
+# Command substitution strips ALL trailing newline bytes from its output, and a
+# git pathname really can END in one — that is exactly what the -z change above
+# made reachable. So `sf=$(safe_path "$f")` silently handed every downstream tool
+# a path one byte short of the real filename: verified, `awk`/`head`/`file` then
+# reported "No such file or directory" and the magic-byte comparison ran on an
+# empty string. `capture VAR cmd...` appends a sentinel byte INSIDE the same
+# substitution and strips only that byte, so the value arrives byte-exact.
+# `printf -v` is bash 3.1+, so it is safe here (the script targets bash 3.2 for
+# the macOS pre-commit hook); `eval` is deliberately avoided.
+capture() {
+  local _target=$1 _out
+  shift
+  _out=$("$@"; printf x)
+  printf -v "$_target" '%s' "${_out%x}"
+}
+
 # Output-only escaping for a pathname that is about to be PRINTED. git pathnames
 # are arbitrary bytes, and now that the file list is NUL-delimited they really can
 # contain LF and CR (that was the point of the -z fix). The findings block is
@@ -250,14 +266,17 @@ safe_path() {
 # rendered as visible two-character escapes and every pathname is emitted behind a
 # fixed `path=` prefix, which also means an attacker-chosen name can never sit at
 # the start of a line where Actions would look for `::`.
-# One awk, not `sed 's/\r/…/'`: BSD sed (macOS, where the pre-commit hook runs)
-# does not understand \r in a regex and would match a literal "r", corrupting every
-# path containing that letter. CR is built with sprintf("%c", 13) rather than a
-# \r regex escape for the same portability reason.
+# Done with bash pattern substitution (bash 2.0+, so 3.2-safe) rather than awk or
+# sed. sed is out because BSD sed (macOS, where the pre-commit hook runs) does not
+# understand \r in a regex and would match a literal "r", corrupting every path
+# containing that letter. awk is out because it is record-oriented: a name ending
+# in a newline has no record after the separator, so `evil.js\n` and `evil.js`
+# rendered IDENTICALLY — the one distinction this function exists to make.
 render_path() {
-  printf 'path=%s' "$(printf '%s' "$1" | LC_ALL=C awk '
-    BEGIN { cr = sprintf("%c", 13) }
-    { gsub(cr, "\\r"); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }')"
+  local p=$1
+  p=${p//$'\r'/'\r'}
+  p=${p//$'\n'/'\n'}
+  printf 'path=%s' "$p"
 }
 
 # Findings accumulate with REAL newlines and are printed with printf '%s', not
@@ -271,7 +290,11 @@ nl='
 bad=""
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue           # deleted/renamed away
-  sf=$(safe_path "$f")
+  # sf is captured byte-exact (see capture() above) because it is used to READ
+  # the file. lf is captured with plain substitution ON PURPOSE: it is only used
+  # to CLASSIFY, and dropping a trailing newline there is what makes a file named
+  # `payload.js<newline>` still match `*.js` and get scanned rather than skipped.
+  capture sf safe_path "$f"
   lf=$(lc "$f")                     # extension matching is case-insensitive
   is_scan_target "$lf" || continue
   is_allowed "$f" && continue        # reviewed known-good minified/vendored file
@@ -327,7 +350,7 @@ done
 # ---------------------------------------------------------------------------
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
-  sf=$(safe_path "$f")
+  capture sf safe_path "$f"         # byte-exact: used to read the file
   lf=$(lc "$f")                     # .WOFF2 must classify exactly like .woff2
   is_binary_asset "$lf" || continue
   is_allowed "$f" && continue
@@ -374,7 +397,7 @@ done
 # ---------------------------------------------------------------------------
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
-  sf=$(safe_path "$f")
+  capture sf safe_path "$f"         # byte-exact: used to read the file
   # Lowercased: on the case-insensitive filesystems VS Code also runs on (macOS,
   # Windows) `.VSCode/tasks.JSON` is loaded exactly like `.vscode/tasks.json`.
   lf=$(lc "$f")

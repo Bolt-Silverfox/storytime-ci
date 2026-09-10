@@ -84,10 +84,10 @@ excluded automatically) and flags a file on **any** of:
 False positives (a genuinely minified/vendored *tracked* file) are cleared by
 adding its `sha256␠␠path` to `.ci-scan-allow.txt` **after review**.
 
-### Path and token handling (four bypasses found by review, all fixed)
+### Path and token handling (five bypasses found by review, all fixed)
 
 The checks above are only as good as (a) the list of files they are applied to
-and (b) the assumption that a token sits on one physical line. Four ways of
+and (b) the assumption that a token sits on one physical line. Five ways of
 naming or formatting a file made the scan skip it *silently*, reporting `clean`
 and exiting 0 — each verified against a real marker payload before the fix, and
 each covered by a regression test in `tests/scan-injection.test.sh`:
@@ -115,6 +115,19 @@ each covered by a regression test in `tests/scan-injection.test.sh`:
   the script, including the argument parser and the magic-byte comparison.
   `lc` uses `tr`, not `${var,,}`, because the latter is bash 4.0+ and this script
   is bash 3.2-safe for the macOS pre-commit hook.
+* **Paths ending in a newline.** Fixing the quoting above made this reachable:
+  `git ls-files -z` hands over a name ending in `\n` intact, but bash command
+  substitution strips *all* trailing newlines from its output, so
+  `sf=$(safe_path "$f")` produced a path one byte short of the real filename.
+  `awk`, `head` and `file` then reported "No such file or directory" — check (1)
+  errored out, and the magic-byte comparison ran on an empty string, flagging a
+  *genuine* font as a mismatch. Captures that feed file access now go through
+  `capture`, which appends a sentinel byte inside the same substitution and
+  strips only that byte. Classification captures (`lc`) deliberately keep plain
+  substitution: dropping the trailing newline there is what lets
+  `payload.js\n` still match `*.js` and be scanned rather than skipped — read the
+  path exactly, classify it leniently.
+
 * **Structural tokens split across lines.** `grep` is line-oriented, but the
   payload's syntax is not: `global.i =` on one line and `"A8-…"` on the next is
   valid JS, and `"runOn":` / `"folderOpen"` on two lines is valid JSONC. Both
@@ -139,7 +152,13 @@ line by line for workflow commands, so a tracked file named `::error::spoofed.js
 or one with an embedded newline could forge annotations (it cannot hide the
 failure — the exit code is unaffected — but it can make the log lie about what was
 found). CR/LF are rendered as visible `\r`/`\n` escapes and every path is emitted
-behind a fixed `path=` prefix so it can never begin a line.
+behind a fixed `path=` prefix so it can never begin a line. The escaping is bash
+pattern substitution rather than `awk`: `awk` is record-oriented, so a name
+ending in a newline has no record after the separator and `evil.js\n` rendered
+identically to `evil.js` — the one distinction the function exists to make. The
+regression test asserts the stronger invariant that the scanner's own header is
+the only output line beginning with `::` at all, which covers a forged
+`::warning::` or `::stop-commands::` and not just `::error::`.
 
 Extension/magic-byte checking accepts **PNG magic for `.ico`**: shipping a bare
 PNG named `favicon.ico` is standard practice and every browser accepts it, so
@@ -174,7 +193,7 @@ repo before.
    repo is re-vendored, its scan fails closed (drift) — intended.
 
 > The path- and token-handling fixes above changed the script, so
-> `SCAN_SCRIPT_SHA256` moved to `c1ca12437fc31a62626b2d6d45432e018d08e94c4fb4239f2e8c9d1f1468656e`. **Every consumer repo needs
+> `SCAN_SCRIPT_SHA256` moved to `95bc5885cee6ae33a0b44918feadd559ad31388804e240e4509afa6aed28262d`. **Every consumer repo needs
 > re-vendoring**; until then its scan fails closed on drift, which is the
 > intended, visible failure mode rather than a silent weakening.
 

@@ -8,9 +8,15 @@ history rewrite in an application repo** (that happened in storytime_be in
 
 **Rules for this repo**
 - Never force-push or rewrite history here.
-- Every change is a PR; bump `SCAN_SCRIPT_SHA256` in the workflow in the same
-  PR whenever `scripts/scan-injection.sh` changes, then re-vendor the script to
-  consumers.
+- Every change is a PR. When `scripts/scan-injection.sh` changes: push that
+  commit, then bump `SCANNER_REF` in `.github/workflows/malware-scan.yml` to it
+  in a **second commit**, and land it with a **merge commit — never squash or
+  rebase** (either rewrites that commit, orphaning the SHA `SCANNER_REF` names).
+  Two self-check steps in the workflow fail the build if you skip the bump or if
+  `SCANNER_REF` stops being reachable from `main`.
+- Land changes with **"Create a merge commit"** only. Squash and rebase rewrite
+  commit SHAs, which orphans anything pinned to them (`SCANNER_REF` here, and the
+  consumers' `uses:` pins).
 - Tag releases (`malware-scan-vN`) for humans; consumers must always pin the
   full 40-char commit SHA (a `# malware-scan-vN` comment may annotate it).
   Never pin a bare tag: tags are mutable.
@@ -34,9 +40,34 @@ permissions:
   contents: read
 jobs:
   scan:
-    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@39ed211bd06d47dfd1d5011ba5f32f6b7e6c4a5d # malware-scan-v1
+    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@<40-char-sha>  # malware-scan-vN
 ```
 
-Each consumer must also vendor an identical `scripts/scan-injection.sh`; the
-workflow verifies its sha256 and fails on drift. See
-`docs/config-injection-defense.md`.
+That pinned line is the **entire** integration: the reusable workflow checks
+`scripts/scan-injection.sh` out of this repo at run time, so consumers vendor no
+script and carry no checksum. See `docs/config-injection-defense.md`.
+
+Keep `.storytime-ci/` in the consumer's `.gitignore`: the workflow checks the
+scanner out into that path, and `actions/checkout` deletes whatever is already
+there. A repo that *tracks* files under `.storytime-ci/` would have them removed
+before the scan and skipped silently, so the workflow refuses to scan such a repo
+and fails the job with an annotation naming the paths.
+
+Take `<40-char-sha>` from **this** repository, not from the repo you are adding
+the caller to:
+
+```bash
+git ls-remote https://github.com/Bolt-Silverfox/storytime-ci.git refs/heads/main | cut -f1
+```
+
+That prints the full 40-char SHA and nothing else (without `cut -f1` the ref name
+follows it after a tab). `git rev-parse origin/main` is wrong here —
+run inside a consumer repo (where you are while adding the caller) it returns
+that repo's own `main`, which does not exist in `storytime-ci`, so the `uses:`
+reference fails to resolve.
+
+The SHA must also be a commit **at or after** the change that removed the
+vendored-script requirement — earlier pins, including
+`39ed211bd06d47dfd1d5011ba5f32f6b7e6c4a5d` (`malware-scan-v1`), run the old
+workflow, which requires a caller-local `scripts/scan-injection.sh` and fails the
+checksum gate without one.

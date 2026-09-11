@@ -11,11 +11,17 @@ marker-agnostic** — it detects the injection *structurally*.
 
 | Piece | Where | Role |
 |---|---|---|
-| `scripts/scan-injection.sh` | every repo (identical, hash-pinned) | The detector. Scans git-tracked files. |
-| `.githooks/pre-commit` | every repo | Local early-warning (scans staged files). Bypassable. |
+| `scripts/scan-injection.sh` | **`storytime-ci` only** — CI fetches it at run time | The detector. Scans git-tracked files. |
 | `.github/workflows/malware-scan.yml` | `storytime-ci` (canonical, reusable) | CI gate + weekly deep scan. Other repos call it. |
-| thin caller workflow | every other repo | 5 lines; invokes the reusable workflow. |
-| branch protection | GitHub settings (owner) | Makes the CI scan **required** → merge-blocking. |
+| thin caller workflow | every other repo | 5 lines, pin only. **Nothing else to vendor.** |
+| `.githooks/pre-commit` + a local `scripts/scan-injection.sh` | `storytime_be`, `storytime-fe` | Local early-warning (scans staged files). Convenience, **allowed to drift** — see below. |
+| branch protection / ruleset | GitHub settings (owner) | Makes the CI scan **required** → merge-blocking. |
+
+Consumer repos used to vendor a byte-identical copy of the script, kept honest by a
+`SCAN_SCRIPT_SHA256` gate in the workflow. That is **gone**: every scanner change
+meant a pin bump *and* a script re-vendor in nine repos, and a repo that had only
+half of it failed closed on drift. The reusable workflow now checks the script out
+of `storytime-ci` itself, so the pinned `uses:` line is the whole integration.
 
 ## The 2026-09 variant (why checks 4 and 5 exist)
 
@@ -175,27 +181,154 @@ git config core.hooksPath .githooks
 Bypassable with `git commit --no-verify` — it is convenience, not the guarantee.
 The **CI required check is the real gate**.
 
-## Single source, no drift
+## Single source: the scanner lives in one repo only
 
-The logic lives only in `scripts/scan-injection.sh`. Every repo vendors an
-**identical** copy; the reusable workflow pins its `sha256`
-(`SCAN_SCRIPT_SHA256`) and fails the build if a repo's copy is missing, stale, or
-tampered. This is exactly the drift that let the scanner arrive *infected* in one
-repo before.
+`scripts/scan-injection.sh` exists in `storytime-ci` and nowhere else that CI
+reads. The reusable workflow runs two checkouts, with a guard between them:
+
+1. `actions/checkout` of the **caller** — the tree to be scanned, in
+   `$GITHUB_WORKSPACE`.
+2. A guard that fails the job if the caller's index contains any path at
+   `.storytime-ci` (see below).
+3. `actions/checkout` of **`Bolt-Silverfox/storytime-ci`** at the immutable
+   `SCANNER_REF` commit, into `.storytime-ci/` with `sparse-checkout: scripts`.
+   `storytime-ci` is public, so no token is involved.
+
+Then `bash .storytime-ci/scripts/scan-injection.sh` runs with the working
+directory still at `$GITHUB_WORKSPACE`. That distinction matters: the scanner
+picks its files from `git ls-files` of the repo it is *run in*, so it scans the
+caller and **not** `storytime-ci`. A nested clone is untracked in the outer repo,
+so the scanner's own files under `.storytime-ci/` are never scanned, and a
+consumer's scan therefore cannot be tripped by this repo's own scanner or
+fixtures (which has caused false positives before). Verified in a real run:
+`git ls-files` listed 8 caller paths and zero under `.storytime-ci/`.
+
+That holds only because no caller tracks anything at that path, and step 2 is
+what makes it true rather than assumed. If a caller *did* commit a file under
+`.storytime-ci/`, `actions/checkout` would delete it before cloning the scanner
+there — a non-default `path:` that is not already a clone of the repo being
+fetched has its contents removed (and a plain file or symlink at that path is
+removed outright, the symlink case taking the caller's real directory with it).
+The caller's index would still list the deleted path, and the scanner skips a
+listed-but-missing path (`[ -f "$f" ] || continue`), so the payload would be
+erased from the scanned tree and the run would report **clean**. The
+scanner-presence check cannot catch it, because the replacement scanner is
+present. Hence the guard: `git ls-files -- ':(icase).storytime-ci'` must be
+empty, or the job fails closed with an annotation naming the offending paths.
+Consumers should keep `.storytime-ci/` in `.gitignore`.
+
+None of this says anything about `storytime-ci`'s *own* run: there the first
+checkout is this repo, so its tracked files are scanned like
+any other consumer's — as they should be. Nothing here trips a check today because
+the scan targets are code/config/data extensions and this repo tracks only `.sh`,
+`.md` and `.yml`.
+
+If that checkout fails or the script is absent, the job **fails closed** with an
+actionable annotation before the scan step. A malware scan that quietly does
+nothing is the worst possible outcome, and this workflow has shipped that bug
+twice (a `grep -q` SIGPIPE under `pipefail` discarding a real detection, and a
+`Review skipped` status that read as a pass).
+
+### Why `SCANNER_REF` is a hardcoded SHA
+
+Ideally the workflow would check the scanner out at *its own* commit, so the two
+could never disagree and there would be nothing to maintain. **That value is not
+reachable from a workflow expression.** Measured in a real cross-workflow run
+(2026-09-10), inside a `workflow_call` job:
+
+* `github.job_workflow_sha` → **empty string**. The claim of that name belongs to
+  the OIDC token, not the `github` context; reading it would require
+  `id-token: write` in every consumer's caller.
+* `github.workflow_sha` / `github.workflow_ref` → the **top-level (calling)**
+  workflow. The probe resolved `workflow_ref` to the caller's own file, so in a
+  real consumer these name the *consumer's* repo and commit, and checking
+  `storytime-ci` out at a consumer's SHA would 404.
+
+So `SCANNER_REF` is a hardcoded 40-char SHA, and the maintenance cost is honest:
+**one value, in one repo**, replacing a checksum that had to be bumped in nine.
+It is not a movable ref, deliberately — an account with write access has planted
+malware in these repos three times and the vector is unresolved, so the malware
+scanner must not resolve through a mutable tag or branch.
+
+The one way it can rot is someone changing the script and forgetting the bump,
+leaving consumers on the old detector. The workflow therefore has a self-check
+step, gated to `github.repository == 'Bolt-Silverfox/storytime-ci'` (skipped in
+every consumer), that fails if `scripts/scan-injection.sh` at HEAD is not
+byte-identical to the copy at `SCANNER_REF`.
+
+A byte comparison cannot see the *other* way it rots, though: a squash or rebase
+merge of a bump PR keeps commit 1's **content** on `main` under a new SHA, so
+`cmp` still passes while the SHA `SCANNER_REF` names is orphaned. GitHub keeps
+serving unreachable objects until they are collected, so consumers stay green and
+then break later for no visible reason — the shape of the 2026-09 outage. A second
+self-check step (also `storytime-ci` only) therefore asserts reachability
+directly: `SCANNER_REF` must be an ancestor of `main`, or of the current commit
+while a bump branch is still open. It deliberately does **not** accept "some
+branch contains it" — with `delete_branch_on_merge` off, a squashed PR's branch
+survives and would satisfy that, which was verified against a simulated squash
+merge. Belt and braces only: the real fix is restricting the `main` ruleset's
+`allowed_merge_methods` to `["merge"]`, which is an owner action (it is currently
+`["merge", "squash", "rebase"]`).
 
 ### Updating the detector
 
-1. Edit `scripts/scan-injection.sh` in `storytime-ci` (the canonical home — the workflow header says so, and this repo exists precisely so a history rewrite elsewhere cannot orphan it).
-2. In the **same PR**, bump `SCAN_SCRIPT_SHA256` in
-   `.github/workflows/malware-scan.yml` to the new
-   `sha256sum scripts/scan-injection.sh`.
-3. Re-vendor the identical script to every other repo (a small PR each). Until a
-   repo is re-vendored, its scan fails closed (drift) — intended.
+1. Edit `scripts/scan-injection.sh` in `storytime-ci` (the canonical home — this
+   repo exists precisely so a history rewrite elsewhere cannot orphan it) and
+   push. Add a regression test in `tests/scan-injection.test.sh`.
+2. In a **second commit on the same branch**, set `SCANNER_REF` in
+   `.github/workflows/malware-scan.yml` to the SHA of commit 1. The self-check
+   step goes green again at that point.
+3. Land it with **"Create a merge commit"** only. Squash *and* rebase rewrite
+   commit 1 into a new SHA and orphan the one `SCANNER_REF` names — while the
+   byte-comparison self-check still passes, so the breakage surfaces later, in
+   consumers. Do not amend or rebase commit 1 after step 2 either. An orphaned pin
+   is the exact accident that silently disabled scanning org-wide in 2026-09.
+4. Bump the pinned SHA in each consumer's caller to the new `storytime-ci` tip.
+   Dependabot already watches the `github-actions` ecosystem in all consumers and
+   opens these PRs; you can also bump by hand. **There is no script to re-vendor
+   and no hash to bump in a consumer** — a consumer still on an older pin keeps
+   running that older, self-consistent scanner instead of failing on drift.
 
-> The path- and token-handling fixes above changed the script, so
-> `SCAN_SCRIPT_SHA256` moved to `95bc5885cee6ae33a0b44918feadd559ad31388804e240e4509afa6aed28262d`. **Every consumer repo needs
-> re-vendoring**; until then its scan fails closed on drift, which is the
-> intended, visible failure mode rather than a silent weakening.
+### The local pre-commit hook keeps a copy, and that copy may drift
+
+`storytime_be` and `storytime-fe` run the scanner from `.githooks/pre-commit`
+against *staged* files, which needs the script on disk before any CI exists. Those
+repos therefore keep a local `scripts/scan-injection.sh`, and it is **allowed to
+be out of date**. This is deliberate:
+
+* it is a **convenience, not a security control** — the hook is opt-in
+  (`git config core.hooksPath .githooks`) and bypassable
+  (`git commit --no-verify`);
+* **CI is the gate that actually blocks**, and CI no longer looks at that file at
+  all — it fetches the pinned copy from `storytime-ci`. A stale local copy can
+  therefore only mean a *weaker local warning*, never a weaker merge gate;
+* the hook already degrades safely: if the script is missing or not executable it
+  prints a notice and exits 0 rather than blocking a commit.
+
+So do **not** add a drift check for it, and do not treat "the local copy is
+behind" as a security finding. Refresh it when convenient — but fetch it at the
+**same commit that repo's caller workflow already pins**, never from `main`. This
+file is executable code that the hook then runs on your machine, so pulling it
+from a movable branch would be a developer-machine execution path that a
+write-access compromise could change without an immutable reference (the very
+threat model this whole document exists for):
+
+```bash
+# the SHA this repo already trusts, taken from its own caller workflow
+SHA=$(grep -oE 'storytime-ci/\.github/workflows/malware-scan\.yml@[0-9a-f]{40}' \
+        .github/workflows/malware-scan.yml | head -n1 | cut -d@ -f2)
+curl -fsSL "https://raw.githubusercontent.com/Bolt-Silverfox/storytime-ci/${SHA}/scripts/scan-injection.sh" \
+  -o scripts/scan-injection.sh && chmod +x scripts/scan-injection.sh
+git diff -- scripts/scan-injection.sh   # read it before you commit it
+```
+
+*Suggestion, not implemented here:* the hook could stop tracking a copy entirely
+and instead fetch the script once into a cache (e.g.
+`.git/cache/scan-injection-<sha>.sh`, keyed on the SHA pinned in that repo's
+caller workflow, downloaded on a miss and reused otherwise), falling back to
+"skip with a notice" when offline. That would make the local and CI detectors the
+same bytes without tracking the file, but it puts a network fetch in the commit
+path, so it is left as a follow-up decision.
 
 ### Regression tests
 
@@ -220,10 +353,47 @@ this repo's own scan.
 
 ## Rollout to another repo
 
-1. Copy `scripts/scan-injection.sh` (identical bytes) and `.githooks/pre-commit`.
-2. Add the thin caller workflow (see `docs/security/malware-scan-caller.example.yml`).
-3. Push; confirm the `malware-scan` check runs green.
-4. **Owner:** add the check to branch protection (below).
+1. Add the thin caller workflow below as `.github/workflows/malware-scan.yml`.
+   That is the whole integration — **no script to copy, no hash to set.**
+2. Push; confirm the `malware-scan` check runs green.
+3. **Owner:** add the check to branch protection / the ruleset (below).
+4. Optional: `.githooks/pre-commit` + a local copy of the script, for a local
+   early warning. Only worth it in repos people actively develop in, and see the
+   drift note above.
+
+### The consumer caller (copy verbatim, then set the pin)
+
+```yaml
+name: malware-scan
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+permissions:
+  contents: read
+jobs:
+  scan:
+    uses: Bolt-Silverfox/storytime-ci/.github/workflows/malware-scan.yml@<40-char-sha>  # malware-scan-vN
+```
+
+Always a **full 40-char commit SHA**, never a bare tag — tags are mutable. The
+`# malware-scan-vN` comment is for humans and for Dependabot's PR titles. The job
+is named `scan`, so the required check appears as
+`scan / config-injection + disguised-font scan`.
+
+Add `github-actions` to that repo's `.github/dependabot.yml` if it is not there
+already, so pin bumps arrive as PRs:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+```
 
 ## Make it merge-blocking (owner action — GitHub UI)
 

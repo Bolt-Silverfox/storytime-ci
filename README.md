@@ -47,6 +47,12 @@ That pinned line is the **entire** integration: the reusable workflow checks
 `scripts/scan-injection.sh` out of this repo at run time, so consumers vendor no
 script and carry no checksum. See `docs/config-injection-defense.md`.
 
+Keep `.storytime-ci/` in the consumer's `.gitignore`: the workflow checks the
+scanner out into that path, and `actions/checkout` deletes whatever is already
+there. A repo that *tracks* files under `.storytime-ci/` would have them removed
+before the scan and skipped silently, so the workflow refuses to scan such a repo
+and fails the job with an annotation naming the paths.
+
 Take `<40-char-sha>` from **this** repository, not from the repo you are adding
 the caller to:
 

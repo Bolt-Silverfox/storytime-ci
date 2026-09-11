@@ -184,11 +184,13 @@ The **CI required check is the real gate**.
 ## Single source: the scanner lives in one repo only
 
 `scripts/scan-injection.sh` exists in `storytime-ci` and nowhere else that CI
-reads. The reusable workflow runs two checkouts:
+reads. The reusable workflow runs two checkouts, with a guard between them:
 
 1. `actions/checkout` of the **caller** — the tree to be scanned, in
    `$GITHUB_WORKSPACE`.
-2. `actions/checkout` of **`Bolt-Silverfox/storytime-ci`** at the immutable
+2. A guard that fails the job if the caller's index contains any path at
+   `.storytime-ci` (see below).
+3. `actions/checkout` of **`Bolt-Silverfox/storytime-ci`** at the immutable
    `SCANNER_REF` commit, into `.storytime-ci/` with `sparse-checkout: scripts`.
    `storytime-ci` is public, so no token is involved.
 
@@ -196,11 +198,27 @@ Then `bash .storytime-ci/scripts/scan-injection.sh` runs with the working
 directory still at `$GITHUB_WORKSPACE`. That distinction matters: the scanner
 picks its files from `git ls-files` of the repo it is *run in*, so it scans the
 caller and **not** `storytime-ci`. A nested clone is untracked in the outer repo,
-so nothing under `.storytime-ci/` is ever scanned, and a consumer's scan therefore
-cannot be tripped by this repo's own scanner or fixtures (which has caused false
-positives before). Verified in a real run: `git ls-files` listed 8 caller paths and
-zero under `.storytime-ci/`. Note this says nothing about `storytime-ci`'s *own*
-run: there the first checkout is this repo, so its tracked files are scanned like
+so the scanner's own files under `.storytime-ci/` are never scanned, and a
+consumer's scan therefore cannot be tripped by this repo's own scanner or
+fixtures (which has caused false positives before). Verified in a real run:
+`git ls-files` listed 8 caller paths and zero under `.storytime-ci/`.
+
+That holds only because no caller tracks anything at that path, and step 2 is
+what makes it true rather than assumed. If a caller *did* commit a file under
+`.storytime-ci/`, `actions/checkout` would delete it before cloning the scanner
+there — a non-default `path:` that is not already a clone of the repo being
+fetched has its contents removed (and a plain file or symlink at that path is
+removed outright, the symlink case taking the caller's real directory with it).
+The caller's index would still list the deleted path, and the scanner skips a
+listed-but-missing path (`[ -f "$f" ] || continue`), so the payload would be
+erased from the scanned tree and the run would report **clean**. The
+scanner-presence check cannot catch it, because the replacement scanner is
+present. Hence the guard: `git ls-files -- ':(icase).storytime-ci'` must be
+empty, or the job fails closed with an annotation naming the offending paths.
+Consumers should keep `.storytime-ci/` in `.gitignore`.
+
+None of this says anything about `storytime-ci`'s *own* run: there the first
+checkout is this repo, so its tracked files are scanned like
 any other consumer's — as they should be. Nothing here trips a check today because
 the scan targets are code/config/data extensions and this repo tracks only `.sh`,
 `.md` and `.yml`.

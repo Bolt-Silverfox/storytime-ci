@@ -183,11 +183,6 @@ jobs:
           if [ -n "$VERSION_FILES" ]; then
             echo "Note: version_files is accepted for compatibility but ignored; the tag is built from package.json, so package.json is what this step compares."
           fi
-          # Caller-supplied and never validated. A newline in a log line starts
-          # a new ::workflow-command::, and no control character can appear in
-          # a git ref name anyway, so drop them.
-          TAG_PREFIX=$(printf '%s' "$TAG_PREFIX" | tr -d '\000-\037' | head -c 40)
-
           # actions/checkout leaves HEAD at the PR's merge commit, whose first
           # parent is the base branch as it stands NOW. Compare against that
           # rather than the base.sha minted into the event payload, or a
@@ -215,31 +210,76 @@ jobs:
           if [ "$COMPARABLE" = 1 ]; then
             # The first step read the version through the filesystem, which
             # follows a symlink; git cat-file does not, and hands back the link
-            # text instead. Reading a symlinked, submoduled or shadowed
-            # manifest as "declares nothing" would make every PR in such a repo
-            # look like a version move, so check the entry's mode first and
-            # fall back to the question the old gate asked — did this path
-            # change at all — when it is not a plain file.
-            BASE_ENTRY=$(git ls-tree "$DIFF_BASE" -- package.json 2>/dev/null) || BASE_ENTRY=""
-            BASE_MODE="${BASE_ENTRY%% *}"
-            case "$BASE_MODE" in
-              '')
-                # No manifest at the base: the PR introduces one, and an empty
-                # blob declares nothing, which differs from any real version.
-                : > "$BASE_BLOB"
-                ;;
-              100644 | 100755)
-                git cat-file blob "$DIFF_BASE:package.json" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
-                ;;
-              *)
-                COMPARABLE=0
-                if git diff --quiet "$DIFF_BASE" HEAD -- package.json; then
-                  echo "::warning::package.json is not a regular file at the base (mode $BASE_MODE), so its version could not be read. The PR does not change that path, so it is not treated as a version bump."
-                  exit 0
-                fi
-                echo "::warning::package.json is not a regular file at the base (mode $BASE_MODE), so its version could not be read. The PR changes that path, so the tag check runs."
-                ;;
-            esac
+            # text instead. Reading a symlinked manifest as "declares nothing"
+            # would make every PR in such a repo look like a version move, so
+            # follow the link through the tree the way a checkout would, with a
+            # hop limit against a cycle.
+            BASE_PATH="package.json"
+            HOPS=0
+            while : ; do
+              BASE_ENTRY=$(git ls-tree "$DIFF_BASE" -- "$BASE_PATH" 2>/dev/null) || BASE_ENTRY=""
+              BASE_MODE="${BASE_ENTRY%% *}"
+              case "$BASE_MODE" in
+                '')
+                  # Nothing at the base: either the PR introduces the manifest,
+                  # or a link points outside the tree. An empty blob declares
+                  # nothing, which differs from any real version, so the tag
+                  # check runs — the conservative direction.
+                  : > "$BASE_BLOB"
+                  break
+                  ;;
+                100644 | 100755)
+                  git cat-file blob "$DIFF_BASE:$BASE_PATH" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+                  break
+                  ;;
+                120000)
+                  HOPS=$((HOPS + 1))
+                  if [ "$HOPS" -gt 8 ]; then
+                    echo "::warning::package.json at the base is a symlink chain more than 8 deep; giving up on reading the base version and running the tag check."
+                    : > "$BASE_BLOB"
+                    break
+                  fi
+                  LINK=$(git cat-file blob "$DIFF_BASE:$BASE_PATH" 2>/dev/null) || LINK=""
+                  case "$LINK" in
+                    '' | /*)
+                      # Absolute or unreadable: not resolvable inside the tree.
+                      : > "$BASE_BLOB"
+                      break
+                      ;;
+                  esac
+                  # Join against the link's own directory and fold away . and
+                  # .., the way a checkout resolves it. git does not normalise
+                  # a path given as <rev>:<path>, so it has to be done here.
+                  BASE_DIR=$(dirname "$BASE_PATH")
+                  JOINED="$LINK"
+                  [ "$BASE_DIR" = "." ] || JOINED="$BASE_DIR/$LINK"
+                  NORM=""
+                  IFS='/' read -r -a SEGS <<< "$JOINED"
+                  for SEG in ${SEGS[@]+"${SEGS[@]}"}; do
+                    case "$SEG" in
+                      '' | .) ;;
+                      ..) NORM="${NORM%/*}"; [ "$NORM" = "${NORM%/*}" ] && NORM="" ;;
+                      *) if [ -z "$NORM" ]; then NORM="$SEG"; else NORM="$NORM/$SEG"; fi ;;
+                    esac
+                  done
+                  if [ -z "$NORM" ]; then
+                    : > "$BASE_BLOB"
+                    break
+                  fi
+                  BASE_PATH="$NORM"
+                  ;;
+                *)
+                  # A tree or a submodule where the manifest should be: nothing
+                  # readable, so treat the base as declaring nothing.
+                  echo "::warning::package.json at the base is not a file (mode $BASE_MODE); its version could not be read, so the tag check runs."
+                  : > "$BASE_BLOB"
+                  break
+                  ;;
+              esac
+            done
+            if [ "$BASE_PATH" != "package.json" ]; then
+              echo "package.json at the base is a symlink; read the version from $BASE_PATH."
+            fi
           fi
 
           if [ "$COMPARABLE" = 1 ]; then
@@ -274,6 +314,16 @@ jobs:
           fi
 
           TAG="${TAG_PREFIX}${PKG}"
+          # tag_prefix is caller-supplied and unvalidated. Let git judge the
+          # composed name rather than trimming it, so the tag looked up is
+          # always the tag configured; a refname cannot contain a control
+          # character, so passing this check also makes $TAG safe to echo —
+          # a newline in a log line would start a new ::workflow-command::.
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            SAFE_TAG=$(printf '%s' "$TAG" | tr -d '\000-\037' | head -c 60)
+            echo "::error::tag_prefix produces an invalid git tag name ('$SAFE_TAG'), so the release tag could not be checked. Fix the tag_prefix input."
+            exit 1
+          fi
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             EXISTING=$(git rev-list -n 1 "refs/tags/$TAG")
             echo "::error::This PR sets the version to $PKG, but tag $TAG already exists (at ${EXISTING:0:8}). release-tag.yml skips when the tag is present, so merging this would leave the release untagged. Bump to an unreleased version instead."

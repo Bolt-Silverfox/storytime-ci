@@ -10,9 +10,12 @@
 #
 #   2. TAG REUSE (only when the PR changes the version) — if a PR bumps the
 #      version to something that is already tagged, release-tag.yml would find
-#      the tag present and silently skip, leaving the release untagged. A PR
-#      that does not touch the version is ignored, so ordinary changes are
-#      never blocked by this.
+#      the tag present and silently skip, leaving the release untagged. The
+#      trigger is package.json's version VALUE differing from the base
+#      branch's, not whether any file was edited, so a dependency bump or a
+#      script edit is not mistaken for a release. The one exception is a base
+#      revision the runner cannot read at all, where the check runs rather
+#      than assume; it says so in the log when that happens.
 name: version-check
 
 on:
@@ -20,11 +23,13 @@ on:
     inputs:
       version_files:
         description: >-
-          Space-separated paths whose change marks a PR as a version bump.
-          Defaults cover npm + Expo layouts.
+          Deprecated and ignored. The tag-reuse check compares package.json's
+          declared version against the base branch, because the release tag is
+          built from that value and nothing else can make the check's claim
+          true. Still accepted so existing callers keep working.
         required: false
         type: string
-        default: 'package.json app.json'
+        default: ''
       tag_prefix:
         description: 'Prefix used by the release tags (v1.2.3 -> "v").'
         required: false
@@ -144,20 +149,216 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           VERSION_FILES: ${{ inputs.version_files }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Pass every configured path straight to git rather than filtering by
-          # what exists in the working tree: a path missing on one side is
-          # exactly what a deletion looks like, and that still counts as a
-          # change to a version file. git ignores paths absent from both sides.
-          # shellcheck disable=SC2086
-          if git diff --quiet "$BASE_SHA" -- $VERSION_FILES; then
-            echo "This PR does not touch $VERSION_FILES — not a version bump, skipping tag check."
-            exit 0
+          # The question this gate has to answer is "did the PR move the
+          # VERSION", not "did it touch a file that happens to carry one".
+          # Diffing the paths answered the second question, so adding a
+          # dependency or editing a script in package.json was classified as a
+          # release and then failed on the tag the unchanged version already
+          # owns.
+          #
+          # Read what the error below asserts: "this PR sets the version to
+          # $PKG". $PKG is package.json's version, because that is what the tag
+          # is built from. So the assertion is true in exactly one case — the
+          # base branch declared something else — and that is the whole test.
+          # No other file can make it true:
+          #
+          #   * app.json cannot. A root app.json declaring expo.version is
+          #     held to package.json's version by the drift check above, so
+          #     moving it alone fails this job before reaching here; any other
+          #     app.json layout does not feed the tag at all. And deleting
+          #     app.json cannot produce an untagged release, which is the harm
+          #     this check exists to prevent. That is a deliberate narrowing of
+          #     the old "a deletion counts as a change" rule, which fired on
+          #     package.json's version — a version the PR had not touched.
+          #   * Nor can any other path, for the same reason: a tag reuse the PR
+          #     did not introduce belongs to the base branch, not to this PR,
+          #     and failing here would only tell the author to bump a version
+          #     they never edited. The trade is that a base branch already
+          #     sitting on a reused tag stays unreported until the next bump,
+          #     instead of failing every unrelated PR until someone notices.
+          #
+          # This rests on the tag being tag_prefix + root package.json .version:
+          # checked against every caller's release-tag.yml, all of which read
+          # `.version` from the root package.json and tag "v$VERSION".
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+          BASE_BLOB="$WORK/base.blob"
+          BASE_DECL="$WORK/base.decl"
+          HEAD_DECL="$WORK/head.decl"
+
+          if [ -n "$VERSION_FILES" ]; then
+            echo "Note: version_files is accepted for compatibility but ignored; the tag is built from package.json, so package.json is what this step compares."
           fi
+          # actions/checkout leaves HEAD at the PR's merge commit, whose first
+          # parent is the base branch as it stands NOW. Compare against that
+          # rather than the base.sha minted into the event payload, or a
+          # release someone else merges into the base while this PR sits open
+          # gets attributed to this PR. Fall back to the payload SHA when HEAD
+          # is not a merge commit.
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
+            DIFF_BASE=$(git rev-parse 'HEAD^1')
+            echo "Comparing against the base branch at $DIFF_BASE (first parent of the merge commit)."
+          else
+            DIFF_BASE="$BASE_SHA"
+            echo "HEAD is not a merge commit; comparing against the event's base SHA ${DIFF_BASE:-<empty>}."
+          fi
+
+          # An unresolvable base — empty input, a force-pushed branch — must
+          # not be mistaken for "the base declares nothing". Note that an empty
+          # DIFF_BASE would make "$DIFF_BASE:package.json" read the INDEX, i.e.
+          # the PR's own content, and every PR would look unchanged.
+          COMPARABLE=1
+          if ! git rev-parse -q --verify "${DIFF_BASE}^{commit}" >/dev/null 2>&1; then
+            echo "::warning::Could not resolve the base commit, so the base version is unknown; running the tag check rather than assuming this PR changes nothing."
+            COMPARABLE=0
+          fi
+
+          if [ "$COMPARABLE" = 1 ]; then
+            # The first step read the version through the filesystem, which
+            # follows a symlink; git cat-file does not, and hands back the link
+            # text instead. Reading a symlinked manifest as "declares nothing"
+            # would make every PR in such a repo look like a version move, so
+            # follow the link through the tree the way a checkout would, with a
+            # hop limit against a cycle.
+            BASE_PATH="package.json"
+            HOPS=0
+            RESOLVED=0
+            while : ; do
+              BASE_ENTRY=$(git ls-tree "$DIFF_BASE" -- "$BASE_PATH" 2>/dev/null) || BASE_ENTRY=""
+              BASE_MODE="${BASE_ENTRY%% *}"
+              case "$BASE_MODE" in
+                100644 | 100755)
+                  git cat-file blob "$DIFF_BASE:$BASE_PATH" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+                  RESOLVED=1
+                  break
+                  ;;
+                120000)
+                  HOPS=$((HOPS + 1))
+                  if [ "$HOPS" -gt 8 ]; then
+                    break
+                  fi
+                  LINK=$(git cat-file blob "$DIFF_BASE:$BASE_PATH" 2>/dev/null) || LINK=""
+                  case "$LINK" in
+                    '' | /*)
+                      # Unreadable, or absolute and therefore outside the tree.
+                      break
+                      ;;
+                  esac
+                  # Join against the link's own directory and fold away . and
+                  # .., the way a checkout resolves it. git does not normalise
+                  # a path written as <rev>:<path> — verified: cat-file on
+                  # a/b/../c.json fails even when a/c.json exists — so the
+                  # folding has to happen here.
+                  BASE_DIR=$(dirname "$BASE_PATH")
+                  JOINED="$LINK"
+                  [ "$BASE_DIR" = "." ] || JOINED="$BASE_DIR/$LINK"
+                  NORM=""
+                  ESCAPED=0
+                  IFS='/' read -r -a SEGS <<< "$JOINED"
+                  for SEG in ${SEGS[@]+"${SEGS[@]}"}; do
+                    case "$SEG" in
+                      '' | .)
+                        ;;
+                      ..)
+                        # Drop the last segment, and only the last one. With
+                        # nothing left to drop the link points above the
+                        # repository root, which is not somewhere this can
+                        # read; re-anchoring at the root would silently read a
+                        # different file.
+                        case "$NORM" in
+                          */*) NORM="${NORM%/*}" ;;
+                          '')  ESCAPED=1 ;;
+                          *)   NORM="" ;;
+                        esac
+                        ;;
+                      *)
+                        if [ -z "$NORM" ]; then NORM="$SEG"; else NORM="$NORM/$SEG"; fi
+                        ;;
+                    esac
+                  done
+                  if [ "$ESCAPED" = 1 ] || [ -z "$NORM" ]; then
+                    break
+                  fi
+                  BASE_PATH="$NORM"
+                  ;;
+                *)
+                  # Absent, a tree, or a submodule.
+                  break
+                  ;;
+              esac
+            done
+
+            if [ "$RESOLVED" = 1 ]; then
+              if [ "$BASE_PATH" != "package.json" ]; then
+                echo "package.json at the base is a symlink; read the version from $BASE_PATH."
+              fi
+            elif [ "$HOPS" -gt 0 ]; then
+              # A link this cannot follow — through a symlinked directory,
+              # outside the tree, or a cycle — while the checkout followed it
+              # fine, which is why the first step read a version at all.
+              # Guessing "the version moved" here would fail every PR in the
+              # repo forever, so say what happened and leave the check alone.
+              COMPARABLE=0
+              echo "::warning::package.json at the base is a symlink this step could not follow (gave up at $BASE_PATH), so the base version is unknown and the tag check is being skipped. Point package.json at a file inside the repository to restore it."
+              exit 0
+            else
+              # Nothing at that path in the base tree: the PR introduces the
+              # manifest, or it is a directory or submodule there. An empty
+              # blob declares nothing, which differs from any real version, so
+              # the tag check runs — the conservative direction.
+              : > "$BASE_BLOB"
+            fi
+          fi
+
+          if [ "$COMPARABLE" = 1 ]; then
+            if ! jq -s -r 'if length != 1 then null else (.[0].version? // null) end | tojson' \
+                  "$BASE_BLOB" > "$BASE_DECL" 2>/dev/null; then
+              # jq refused the blob. A malformed manifest at the base declaring
+              # nothing is the expected case — but a jq that cannot run would
+              # land here too, and that must not quietly turn the gate off, so
+              # make it prove itself first. (A multi-document file does not
+              # reach this branch: jq -s parses it fine and the length test
+              # rejects it.)
+              if ! jq -n -e 'true' >/dev/null 2>&1; then
+                echo "::error::jq cannot run on this runner, so the base version could not be read. Failing rather than passing the check silently."
+                exit 1
+              fi
+              printf 'null\n' > "$BASE_DECL"
+            fi
+
+            # $PKG passed the SemVer check in the first step, so it is a
+            # single-line string over [0-9A-Za-z.+-]; --arg carries it into jq
+            # without a quoting question, and tojson renders both sides the
+            # same way. Comparing the rendered forms as bytes keeps a base
+            # value that differs only by a NUL or a trailing newline — the two
+            # things $( ) silently drops — from passing as equal.
+            jq -n -r --arg pkg "$PKG" '$pkg | tojson' > "$HEAD_DECL"
+
+            if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
+              echo "package.json already declared $PKG on the base branch — this PR does not move the version, skipping tag check."
+              exit 0
+            fi
+            echo "package.json version differs from the base branch; this PR sets it to $PKG."
+          fi
+
           TAG="${TAG_PREFIX}${PKG}"
+          # tag_prefix is caller-supplied and unvalidated. Let git judge the
+          # composed name rather than trimming it, so the tag looked up is
+          # always the tag configured; a refname cannot contain a control
+          # character, so passing this check also makes $TAG safe to echo —
+          # a newline in a log line would start a new ::workflow-command::.
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            # || true: head closing the pipe early would otherwise make this
+            # substitution exit 141 and kill the step before the message.
+            SAFE_TAG=$(printf '%s' "$TAG" | tr -d '\000-\037' | head -c 60 || true)
+            echo "::error::tag_prefix produces an invalid git tag name ('$SAFE_TAG'), so the release tag could not be checked. Fix the tag_prefix input."
+            exit 1
+          fi
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            EXISTING=$(git rev-list -n 1 "$TAG")
+            EXISTING=$(git rev-list -n 1 "refs/tags/$TAG")
             echo "::error::This PR sets the version to $PKG, but tag $TAG already exists (at ${EXISTING:0:8}). release-tag.yml skips when the tag is present, so merging this would leave the release untagged. Bump to an unreleased version instead."
             exit 1
           fi

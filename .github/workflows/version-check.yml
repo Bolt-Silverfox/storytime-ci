@@ -27,7 +27,7 @@ on:
           true. Still accepted so existing callers keep working.
         required: false
         type: string
-        default: 'package.json app.json'
+        default: ''
       tag_prefix:
         description: 'Prefix used by the release tags (v1.2.3 -> "v").'
         required: false
@@ -181,11 +181,15 @@ jobs:
           HEAD_DECL="$WORK/head.decl"
 
           if [ -n "$VERSION_FILES" ]; then
-            echo "Note: version_files is accepted for compatibility but no longer selects what is compared; the tag is built from package.json, so package.json is what this step reads."
+            echo "Note: version_files is accepted for compatibility but ignored; the tag is built from package.json, so package.json is what this step compares."
           fi
+          # Caller-supplied and never validated. A newline in a log line starts
+          # a new ::workflow-command::, and no control character can appear in
+          # a git ref name anyway, so drop them.
+          TAG_PREFIX=$(printf '%s' "$TAG_PREFIX" | tr -d '\000-\037' | head -c 40)
 
           # actions/checkout leaves HEAD at the PR's merge commit, whose first
-          # parent is the base branch as it stands NOW. Diff against that
+          # parent is the base branch as it stands NOW. Compare against that
           # rather than the base.sha minted into the event payload, or a
           # release someone else merges into the base while this PR sits open
           # gets attributed to this PR. Fall back to the payload SHA when HEAD
@@ -195,40 +199,79 @@ jobs:
             echo "Comparing against the base branch at $DIFF_BASE (first parent of the merge commit)."
           else
             DIFF_BASE="$BASE_SHA"
-            echo "HEAD is not a merge commit; comparing against the event's base SHA $DIFF_BASE."
+            echo "HEAD is not a merge commit; comparing against the event's base SHA ${DIFF_BASE:-<empty>}."
           fi
 
-          # An absent package.json at the base is a legitimate state — the PR
-          # that introduces the manifest — and leaves an empty blob, which
-          # declares nothing and so differs from any real version.
-          git cat-file blob "$DIFF_BASE:package.json" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+          # An unresolvable base — empty input, a force-pushed branch — must
+          # not be mistaken for "the base declares nothing". Note that an empty
+          # DIFF_BASE would make "$DIFF_BASE:package.json" read the INDEX, i.e.
+          # the PR's own content, and every PR would look unchanged.
+          COMPARABLE=1
+          if ! git rev-parse -q --verify "${DIFF_BASE}^{commit}" >/dev/null 2>&1; then
+            echo "::warning::Could not resolve the base commit, so the base version is unknown; running the tag check rather than assuming this PR changes nothing."
+            COMPARABLE=0
+          fi
 
-          if ! jq -s -r 'if length != 1 then null else (.[0].version? // null) end | tojson' \
-                "$BASE_BLOB" > "$BASE_DECL" 2>/dev/null; then
-            # jq refused the blob. A malformed or multi-document manifest at
-            # the base declaring nothing is the expected case — but a jq that
-            # cannot run would land here too, and that must not quietly turn
-            # the gate off, so make it prove itself first.
-            if ! jq -n -e 'true' >/dev/null 2>&1; then
-              echo "::error::jq cannot run on this runner, so the base version could not be read. Failing rather than passing the check silently."
-              exit 1
+          if [ "$COMPARABLE" = 1 ]; then
+            # The first step read the version through the filesystem, which
+            # follows a symlink; git cat-file does not, and hands back the link
+            # text instead. Reading a symlinked, submoduled or shadowed
+            # manifest as "declares nothing" would make every PR in such a repo
+            # look like a version move, so check the entry's mode first and
+            # fall back to the question the old gate asked — did this path
+            # change at all — when it is not a plain file.
+            BASE_ENTRY=$(git ls-tree "$DIFF_BASE" -- package.json 2>/dev/null) || BASE_ENTRY=""
+            BASE_MODE="${BASE_ENTRY%% *}"
+            case "$BASE_MODE" in
+              '')
+                # No manifest at the base: the PR introduces one, and an empty
+                # blob declares nothing, which differs from any real version.
+                : > "$BASE_BLOB"
+                ;;
+              100644 | 100755)
+                git cat-file blob "$DIFF_BASE:package.json" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+                ;;
+              *)
+                COMPARABLE=0
+                if git diff --quiet "$DIFF_BASE" HEAD -- package.json; then
+                  echo "::warning::package.json is not a regular file at the base (mode $BASE_MODE), so its version could not be read. The PR does not change that path, so it is not treated as a version bump."
+                  exit 0
+                fi
+                echo "::warning::package.json is not a regular file at the base (mode $BASE_MODE), so its version could not be read. The PR changes that path, so the tag check runs."
+                ;;
+            esac
+          fi
+
+          if [ "$COMPARABLE" = 1 ]; then
+            if ! jq -s -r 'if length != 1 then null else (.[0].version? // null) end | tojson' \
+                  "$BASE_BLOB" > "$BASE_DECL" 2>/dev/null; then
+              # jq refused the blob. A malformed manifest at the base declaring
+              # nothing is the expected case — but a jq that cannot run would
+              # land here too, and that must not quietly turn the gate off, so
+              # make it prove itself first. (A multi-document file does not
+              # reach this branch: jq -s parses it fine and the length test
+              # rejects it.)
+              if ! jq -n -e 'true' >/dev/null 2>&1; then
+                echo "::error::jq cannot run on this runner, so the base version could not be read. Failing rather than passing the check silently."
+                exit 1
+              fi
+              printf 'null\n' > "$BASE_DECL"
             fi
-            printf 'null\n' > "$BASE_DECL"
-          fi
 
-          # $PKG passed the SemVer check in the first step, so it is a
-          # single-line string over [0-9A-Za-z.+-]; --arg carries it into jq
-          # without a quoting question, and tojson renders both sides the same
-          # way. Comparing the rendered forms as bytes keeps a base value that
-          # differs only by a NUL or a trailing newline — the two things $( )
-          # silently drops — from passing as equal.
-          jq -n -r --arg pkg "$PKG" '$pkg | tojson' > "$HEAD_DECL"
+            # $PKG passed the SemVer check in the first step, so it is a
+            # single-line string over [0-9A-Za-z.+-]; --arg carries it into jq
+            # without a quoting question, and tojson renders both sides the
+            # same way. Comparing the rendered forms as bytes keeps a base
+            # value that differs only by a NUL or a trailing newline — the two
+            # things $( ) silently drops — from passing as equal.
+            jq -n -r --arg pkg "$PKG" '$pkg | tojson' > "$HEAD_DECL"
 
-          if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
-            echo "package.json already declared $PKG on the base branch — this PR does not move the version, skipping tag check."
-            exit 0
+            if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
+              echo "package.json already declared $PKG on the base branch — this PR does not move the version, skipping tag check."
+              exit 0
+            fi
+            echo "package.json version differs from the base branch; this PR sets it to $PKG."
           fi
-          echo "package.json version differs from the base branch; this PR sets it to $PKG."
 
           TAG="${TAG_PREFIX}${PKG}"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then

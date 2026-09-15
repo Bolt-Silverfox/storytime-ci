@@ -225,69 +225,91 @@ jobs:
             # hop limit against a cycle.
             BASE_PATH="package.json"
             HOPS=0
+            RESOLVED=0
             while : ; do
               BASE_ENTRY=$(git ls-tree "$DIFF_BASE" -- "$BASE_PATH" 2>/dev/null) || BASE_ENTRY=""
               BASE_MODE="${BASE_ENTRY%% *}"
               case "$BASE_MODE" in
-                '')
-                  # Nothing at the base: either the PR introduces the manifest,
-                  # or a link points outside the tree. An empty blob declares
-                  # nothing, which differs from any real version, so the tag
-                  # check runs — the conservative direction.
-                  : > "$BASE_BLOB"
-                  break
-                  ;;
                 100644 | 100755)
                   git cat-file blob "$DIFF_BASE:$BASE_PATH" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+                  RESOLVED=1
                   break
                   ;;
                 120000)
                   HOPS=$((HOPS + 1))
                   if [ "$HOPS" -gt 8 ]; then
-                    echo "::warning::package.json at the base is a symlink chain more than 8 deep; giving up on reading the base version and running the tag check."
-                    : > "$BASE_BLOB"
                     break
                   fi
                   LINK=$(git cat-file blob "$DIFF_BASE:$BASE_PATH" 2>/dev/null) || LINK=""
                   case "$LINK" in
                     '' | /*)
-                      # Absolute or unreadable: not resolvable inside the tree.
-                      : > "$BASE_BLOB"
+                      # Unreadable, or absolute and therefore outside the tree.
                       break
                       ;;
                   esac
                   # Join against the link's own directory and fold away . and
                   # .., the way a checkout resolves it. git does not normalise
-                  # a path given as <rev>:<path>, so it has to be done here.
+                  # a path written as <rev>:<path> — verified: cat-file on
+                  # a/b/../c.json fails even when a/c.json exists — so the
+                  # folding has to happen here.
                   BASE_DIR=$(dirname "$BASE_PATH")
                   JOINED="$LINK"
                   [ "$BASE_DIR" = "." ] || JOINED="$BASE_DIR/$LINK"
                   NORM=""
+                  ESCAPED=0
                   IFS='/' read -r -a SEGS <<< "$JOINED"
                   for SEG in ${SEGS[@]+"${SEGS[@]}"}; do
                     case "$SEG" in
-                      '' | .) ;;
-                      ..) NORM="${NORM%/*}"; [ "$NORM" = "${NORM%/*}" ] && NORM="" ;;
-                      *) if [ -z "$NORM" ]; then NORM="$SEG"; else NORM="$NORM/$SEG"; fi ;;
+                      '' | .)
+                        ;;
+                      ..)
+                        # Drop the last segment, and only the last one. With
+                        # nothing left to drop the link points above the
+                        # repository root, which is not somewhere this can
+                        # read; re-anchoring at the root would silently read a
+                        # different file.
+                        case "$NORM" in
+                          */*) NORM="${NORM%/*}" ;;
+                          '')  ESCAPED=1 ;;
+                          *)   NORM="" ;;
+                        esac
+                        ;;
+                      *)
+                        if [ -z "$NORM" ]; then NORM="$SEG"; else NORM="$NORM/$SEG"; fi
+                        ;;
                     esac
                   done
-                  if [ -z "$NORM" ]; then
-                    : > "$BASE_BLOB"
+                  if [ "$ESCAPED" = 1 ] || [ -z "$NORM" ]; then
                     break
                   fi
                   BASE_PATH="$NORM"
                   ;;
                 *)
-                  # A tree or a submodule where the manifest should be: nothing
-                  # readable, so treat the base as declaring nothing.
-                  echo "::warning::package.json at the base is not a file (mode $BASE_MODE); its version could not be read, so the tag check runs."
-                  : > "$BASE_BLOB"
+                  # Absent, a tree, or a submodule.
                   break
                   ;;
               esac
             done
-            if [ "$BASE_PATH" != "package.json" ]; then
-              echo "package.json at the base is a symlink; read the version from $BASE_PATH."
+
+            if [ "$RESOLVED" = 1 ]; then
+              if [ "$BASE_PATH" != "package.json" ]; then
+                echo "package.json at the base is a symlink; read the version from $BASE_PATH."
+              fi
+            elif [ "$HOPS" -gt 0 ]; then
+              # A link this cannot follow — through a symlinked directory,
+              # outside the tree, or a cycle — while the checkout followed it
+              # fine, which is why the first step read a version at all.
+              # Guessing "the version moved" here would fail every PR in the
+              # repo forever, so say what happened and leave the check alone.
+              COMPARABLE=0
+              echo "::warning::package.json at the base is a symlink this step could not follow (gave up at $BASE_PATH), so the base version is unknown and the tag check is being skipped. Point package.json at a file inside the repository to restore it."
+              exit 0
+            else
+              # Nothing at that path in the base tree: the PR introduces the
+              # manifest, or it is a directory or submodule there. An empty
+              # blob declares nothing, which differs from any real version, so
+              # the tag check runs — the conservative direction.
+              : > "$BASE_BLOB"
             fi
           fi
 

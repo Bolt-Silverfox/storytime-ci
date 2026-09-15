@@ -11,9 +11,9 @@
 #   2. TAG REUSE (only when the PR changes the version) — if a PR bumps the
 #      version to something that is already tagged, release-tag.yml would find
 #      the tag present and silently skip, leaving the release untagged. A PR
-#      that does not touch the version is ignored, so ordinary changes are
-#      never blocked by this: the base and head manifests are compared by the
-#      version VALUE they declare, not by whether the file was edited, so a
+#      that leaves the declared version alone is ignored, so ordinary changes
+#      are never blocked by this: base and head are compared by the version
+#      VALUE each manifest declares, not by whether the file was edited, so a
 #      dependency bump in package.json is not mistaken for a release.
 name: version-check
 
@@ -23,9 +23,10 @@ on:
       version_files:
         description: >-
           Space-separated paths whose declared version marks a PR as a version
-          bump. JSON manifests are compared by value (.version, or Expo's
-          .expo.version); any other path falls back to "was it edited at all".
-          Defaults cover npm + Expo layouts.
+          bump. Each is compared between base and head by the version it
+          declares (.version, or Expo's .expo.version); a path that declares
+          neither is not a version signal. Globs are matched by git, not the
+          shell. Defaults cover npm + Expo layouts.
         required: false
         type: string
         default: 'package.json app.json'
@@ -158,14 +159,29 @@ jobs:
           # release and then failed on the tag the unchanged version already
           # owns.
           #
-          # So: ask git which files under each configured pathspec the PR
-          # actually changed, then judge each of those by the version VALUE it
-          # declares. A file whose declared version is identical on both sides
-          # is not a version move, however much else in it changed.
+          # Note what the error below actually asserts: "this PR sets the
+          # version to $PKG". If the declared version is the same as the base
+          # branch's, that sentence is false however many files moved — the tag
+          # was already claimed by a commit this PR did not write. So the only
+          # sound trigger is a change to the version VALUE, and that is what is
+          # computed here: git lists the files the PR changed under each
+          # configured pathspec, and each one is compared to its base revision
+          # by the version it declares (.version, or Expo's .expo.version).
+          #
+          # A file we cannot read a version from counts as declaring nothing.
+          # Nothing-to-nothing is not a move, so an app.json without an
+          # expo.version, or a non-JSON manifest, no longer blocks a PR. The
+          # cost of that choice is a manifest keeping its version under a key
+          # this does not know (a release-please manifest, say): its bump is
+          # invisible here. That is acceptable precisely because the tag comes
+          # from package.json — a repo whose version does not live there is not
+          # one this tag check can speak about anyway.
           BASE_BLOB=$(mktemp)
           HEAD_BLOB=$(mktemp)
+          BASE_DECL=$(mktemp)
+          HEAD_DECL=$(mktemp)
           CHANGED=$(mktemp)
-          trap 'rm -f "$BASE_BLOB" "$HEAD_BLOB" "$CHANGED"' EXIT
+          trap 'rm -f "$BASE_BLOB" "$HEAD_BLOB" "$BASE_DECL" "$HEAD_DECL" "$CHANGED"' EXIT
 
           # Split on whitespace the way the old unquoted `git diff --
           # $VERSION_FILES` did — including newlines, so a caller writing the
@@ -179,16 +195,14 @@ jobs:
           set +f
 
           if [ "${#FILES[@]}" -eq 0 ]; then
-            # Nothing to compare means nothing can prove this is not a bump, so
-            # fail closed and run the tag check — what an empty list did before,
-            # when it diffed the whole tree.
-            echo "::warning::version_files is empty, so no manifest could be compared; running the tag check unconditionally. Configure at least one manifest path."
-            MOVED=1
-          else
-            MOVED=0
+            # package.json is the file the tag is built from, so it is the one
+            # path that always has to be consulted.
+            echo "version_files is empty; comparing package.json only."
+            FILES=(package.json)
           fi
 
-          for tok in ${FILES[@]+"${FILES[@]}"}; do
+          MOVED=0
+          for tok in "${FILES[@]}"; do
             # Two commits, not commit-vs-worktree: every read below comes from
             # git, so an untracked or ignored file cannot look like one this PR
             # added. --no-renames keeps a rename visible as a delete plus an
@@ -204,69 +218,49 @@ jobs:
             fi
 
             while IFS= read -r -d '' f; do
-              # A path is attacker-controlled (a PR can add a file with a
-              # newline in its name) and a newline inside a log line starts a
-              # new ::workflow-command::. Strip the control characters.
+              # A path is attacker-controlled (a PR can add a file whose name
+              # contains a newline, and a newline inside a log line starts a
+              # new ::workflow-command::), so strip the control characters
+              # before it is echoed.
               SAFE=$(printf '%s' "$f" | tr -d '\000-\037' | head -c 200)
 
-              BASE_PRESENT=0
-              if git cat-file blob "$BASE_SHA:$f" > "$BASE_BLOB" 2>/dev/null; then
-                BASE_PRESENT=1
-              fi
-              HEAD_PRESENT=0
-              if git cat-file blob "HEAD:$f" > "$HEAD_BLOB" 2>/dev/null; then
-                HEAD_PRESENT=1
-              fi
+              git cat-file blob "$BASE_SHA:$f" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
+              git cat-file blob "HEAD:$f" > "$HEAD_BLOB" 2>/dev/null || : > "$HEAD_BLOB"
 
-              if [ "$BASE_PRESENT" = 1 ] && [ "$HEAD_PRESENT" = 1 ]; then
-                # Compare the two values inside jq, never as shell strings:
-                # $( ) drops NUL bytes and trailing newlines, which is exactly
-                # how two different values come to look equal. The drift check
-                # above guards the same boundary the same way.
-                #
-                # Neither sentinel can collide with a real value: tojson of the
-                # string bad is "\"bad\"" and of the string null is "\"null\"",
-                # quotes included, while JSON null renders as bare null.
-                VERDICT=$(jq -n -r --slurpfile b "$BASE_BLOB" --slurpfile h "$HEAD_BLOB" '
-                  def declared:
-                    if length != 1 then "bad"
-                    else ((.[0] | (.version? // (.expo? | .version?) // null)) | tojson)
-                    end;
-                  ($b | declared) as $bv | ($h | declared) as $hv |
-                  if $bv == "bad" or $hv == "bad" then "unknown"
-                  elif $bv == "null" and $hv == "null" then "unknown"
-                  elif $bv == $hv then "same"
-                  else "moved"
-                  end' 2>/dev/null) || VERDICT="unknown"
+              # Reduce each side to the versions it declares and compare the
+              # two results as BYTES, with cmp. Nothing reaches a shell
+              # variable: $( ) drops NUL bytes and trailing newlines, which is
+              # exactly how two different values come to look equal. The drift
+              # check above guards the same boundary the same way.
+              #
+              # Both keys are kept, rather than .version winning, so an
+              # app.json that carries an unrelated top-level "version" cannot
+              # hide a bump to expo.version — and package.json, which may
+              # legitimately hold an "expo" block, is not read the wrong way
+              # round either.
+              #
+              # A side that is absent, malformed, or not a single JSON document
+              # declares nothing, which is also what a JSON file with no
+              # version key declares. Nothing-to-nothing is not a move.
+              DECLARE='if length != 1 then null else [(.[0].version? // null), (.[0].expo?.version? // null)] end | tojson'
+              jq -s -r "$DECLARE" "$BASE_BLOB" > "$BASE_DECL" 2>/dev/null || echo null > "$BASE_DECL"
+              jq -s -r "$DECLARE" "$HEAD_BLOB" > "$HEAD_DECL" 2>/dev/null || echo null > "$HEAD_DECL"
+
+              if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
+                VERDICT="same"
               else
-                # Present on one side only: added or deleted. The declared
-                # version moved to or from nothing, which still counts, as it
-                # did before.
-                VERDICT="added-or-deleted"
+                VERDICT="moved"
               fi
 
-              case "$VERDICT" in
-                same)
-                  echo "$SAFE: changed, but the declared version is unchanged from base."
-                  ;;
-                moved)
-                  echo "$SAFE: the declared version changed between base and head."
-                  MOVED=1
-                  ;;
-                added-or-deleted)
-                  echo "$SAFE: added or deleted by this PR."
-                  MOVED=1
-                  ;;
-                unknown)
-                  # No version we can read on both sides — a non-JSON manifest,
-                  # a malformed or multi-document file, JSON that declares no
-                  # version. Fall back to what the file diff already told us,
-                  # which is the conservative direction: it can only make the
-                  # gate run, never make it skip.
-                  echo "$SAFE: changed, and no version is readable on both sides — treating it as a version change."
-                  MOVED=1
-                  ;;
-              esac
+              if [ "$VERDICT" = "same" ]; then
+                echo "$SAFE: changed, but declares the same version as the base."
+              else
+                # This covers a deletion as well as an edit: a version file the
+                # PR removes goes from declaring something to declaring
+                # nothing, which stays a version move, as it was before.
+                echo "$SAFE: the declared version changed between base and head."
+                MOVED=1
+              fi
             done < "$CHANGED"
           done
 

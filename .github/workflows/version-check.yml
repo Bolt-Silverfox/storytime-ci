@@ -10,11 +10,10 @@
 #
 #   2. TAG REUSE (only when the PR changes the version) — if a PR bumps the
 #      version to something that is already tagged, release-tag.yml would find
-#      the tag present and silently skip, leaving the release untagged. A PR
-#      that leaves the declared version alone is ignored, so ordinary changes
-#      are never blocked by this: base and head are compared by the version
-#      VALUE each manifest declares, not by whether the file was edited, so a
-#      dependency bump in package.json is not mistaken for a release.
+#      the tag present and silently skip, leaving the release untagged. The
+#      trigger is package.json's version VALUE differing from the base
+#      branch's, not whether any file was edited, so a dependency bump or a
+#      script edit is never mistaken for a release.
 name: version-check
 
 on:
@@ -22,11 +21,10 @@ on:
     inputs:
       version_files:
         description: >-
-          Space-separated paths whose declared version marks a PR as a version
-          bump. Each is compared between base and head by the version it
-          declares (.version, or Expo's .expo.version); a path that declares
-          neither is not a version signal. Globs are matched by git, not the
-          shell. Defaults cover npm + Expo layouts.
+          Deprecated and ignored. The tag-reuse check compares package.json's
+          declared version against the base branch, because the release tag is
+          built from that value and nothing else can make the check's claim
+          true. Still accepted so existing callers keep working.
         required: false
         type: string
         default: 'package.json app.json'
@@ -159,56 +157,39 @@ jobs:
           # release and then failed on the tag the unchanged version already
           # owns.
           #
-          # Note what the error below actually asserts: "this PR sets the
-          # version to $PKG". If the declared version matches the base
-          # branch's, that sentence is false however many files moved — the tag
-          # was claimed by a commit this PR did not write. So the trigger is a
-          # change to the version VALUE: git lists the files the PR changed
-          # under each configured pathspec, and each is compared to its base
-          # revision by the version it declares.
+          # Read what the error below asserts: "this PR sets the version to
+          # $PKG". $PKG is package.json's version, because that is what the tag
+          # is built from. So the assertion is true in exactly one case — the
+          # base branch declared something else — and that is the whole test.
+          # No other file can make it true:
+          #
+          #   * app.json cannot. The drift check above already forces
+          #     expo.version to equal package.json's, so if app.json moved on
+          #     its own this job has failed before reaching here; and deleting
+          #     app.json cannot produce an untagged release, which is the harm
+          #     this check exists to prevent. That is a deliberate narrowing of
+          #     the old "a deletion counts as a change" rule, which fired on
+          #     package.json's version — a version the PR had not touched.
+          #   * Nor can any other path, for the same reason: a tag reuse the PR
+          #     did not introduce belongs to the base branch, not to this PR,
+          #     and failing here would only tell the author to bump a version
+          #     they never edited.
           WORK=$(mktemp -d)
           trap 'rm -rf "$WORK"' EXIT
           BASE_BLOB="$WORK/base.blob"
-          HEAD_BLOB="$WORK/head.blob"
           BASE_DECL="$WORK/base.decl"
           HEAD_DECL="$WORK/head.decl"
-          CHANGED="$WORK/changed"
 
-          # What a file declares, reduced to one line of JSON.
-          #
-          # BOTH keys are kept rather than letting .version win, so an app.json
-          # carrying an unrelated top-level "version" cannot hide a bump to
-          # expo.version. The cost is the mirror image: editing an unrelated
-          # "expo" block inside package.json reads as a version move. Blocking
-          # a rare PR is the better failure of the two.
-          #
-          # Absent, malformed, multi-document, and "valid JSON with no version
-          # key" all have to reduce to the SAME value, or the transitions
-          # between them (adding a version-less app.json, repairing a broken
-          # one) look like version moves and block the PR.
-          declared_versions() {
-            if jq -s -r '
-                  if length != 1 then [null, null]
-                  else [(.[0].version? // null), (.[0].expo?.version? // null)]
-                  end | tojson' "$1" > "$2" 2>/dev/null; then
-              return 0
-            fi
-            # jq refused the input. Malformed JSON declaring nothing is the
-            # expected case — but a jq that cannot run would land here too, and
-            # that must not quietly turn the gate off, so make it prove itself.
-            if ! jq -n -e 'true' >/dev/null 2>&1; then
-              echo "::error::jq cannot run on this runner, so no version could be read. Failing rather than passing the check silently."
-              exit 1
-            fi
-            printf '[null,null]\n' > "$2"
-          }
+          if [ -n "$VERSION_FILES" ]; then
+            echo "Note: version_files is accepted for compatibility but no longer selects what is compared; the tag is built from package.json, so package.json is what this step reads."
+          fi
 
           # actions/checkout leaves HEAD at the PR's merge commit, whose first
           # parent is the base branch as it stands NOW. Diff against that
-          # instead of the base.sha minted into the event payload, or a release
-          # someone else merges into the base while this PR sits open gets
-          # attributed to this PR. Fall back to the payload SHA when HEAD is
-          # not a merge commit.
+          # rather than the base.sha minted into the event payload, or a
+          # release someone else merges into the base while this PR sits open
+          # gets attributed to this PR. Fall back to the payload SHA when HEAD
+          # is not a merge commit.
           if git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
             DIFF_BASE=$(git rev-parse 'HEAD^1')
             echo "Comparing against the base branch at $DIFF_BASE (first parent of the merge commit)."
@@ -217,88 +198,38 @@ jobs:
             echo "HEAD is not a merge commit; comparing against the event's base SHA $DIFF_BASE."
           fi
 
-          # Split on whitespace the way the old unquoted `git diff --
-          # $VERSION_FILES` did — including newlines, so a caller writing the
-          # list as a YAML block scalar keeps every path — but with pathname
-          # expansion OFF. bash would only expand a glob against the checked
-          # out head, which hides a file the PR deleted; passing the pattern
-          # through to git matches it against both revisions instead.
-          set -f
-          # shellcheck disable=SC2206
-          FILES=($VERSION_FILES)
-          set +f
+          # An absent package.json at the base is a legitimate state — the PR
+          # that introduces the manifest — and leaves an empty blob, which
+          # declares nothing and so differs from any real version.
+          git cat-file blob "$DIFF_BASE:package.json" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
 
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            # package.json is the file the tag is built from, so it is the one
-            # path that always has to be consulted.
-            echo "version_files is empty; comparing package.json only."
-            FILES=(package.json)
+          if ! jq -s -r 'if length != 1 then null else (.[0].version? // null) end | tojson' \
+                "$BASE_BLOB" > "$BASE_DECL" 2>/dev/null; then
+            # jq refused the blob. A malformed or multi-document manifest at
+            # the base declaring nothing is the expected case — but a jq that
+            # cannot run would land here too, and that must not quietly turn
+            # the gate off, so make it prove itself first.
+            if ! jq -n -e 'true' >/dev/null 2>&1; then
+              echo "::error::jq cannot run on this runner, so the base version could not be read. Failing rather than passing the check silently."
+              exit 1
+            fi
+            printf 'null\n' > "$BASE_DECL"
           fi
 
-          MOVED=0
-          MATCHED_ANY=0
-          for tok in "${FILES[@]}"; do
-            # git ls-files, NOT ls-tree: ls-tree ignores glob pathspecs
-            # outright (`ls-tree -r HEAD -- 'pkgs/*/package.json'` matches
-            # nothing), which would report a working config as inert. A path
-            # that only existed at the base is picked up below, from the diff.
-            if [ -n "$(git ls-files -- "$tok" 2>/dev/null)" ]; then
-              MATCHED_ANY=1
-            fi
+          # $PKG passed the SemVer check in the first step, so it is a
+          # single-line string over [0-9A-Za-z.+-]; --arg carries it into jq
+          # without a quoting question, and tojson renders both sides the same
+          # way. Comparing the rendered forms as bytes keeps a base value that
+          # differs only by a NUL or a trailing newline — the two things $( )
+          # silently drops — from passing as equal.
+          jq -n -r --arg pkg "$PKG" '$pkg | tojson' > "$HEAD_DECL"
 
-            # Two commits, not commit-vs-worktree: every read below comes from
-            # git, so an untracked or ignored file cannot look like one this PR
-            # added. --no-renames keeps a rename visible as a delete plus an
-            # add rather than collapsing to the destination path alone.
-            if ! git diff --no-renames --name-only -z "$DIFF_BASE" HEAD -- "$tok" > "$CHANGED" 2>/dev/null; then
-              # Only a bad revision or malformed pathspec magic gets here; a
-              # path that simply matches nothing is not an error to git.
-              echo "::warning::version_files entry '$tok' could not be diffed; treating it as a version change."
-              MOVED=1
-              continue
-            fi
-            if [ ! -s "$CHANGED" ]; then
-              echo "version_files entry '$tok': no file under this path changed."
-              continue
-            fi
-            MATCHED_ANY=1
-
-            while IFS= read -r -d '' f; do
-              # A path is attacker-controlled — a PR can add a file whose name
-              # contains a newline, or starts with "::" — and a log line that
-              # begins with one becomes a GitHub workflow command. Strip the
-              # control characters, and never start the line with the path.
-              SAFE=$(printf '%s' "$f" | tr -d '\000-\037' | head -c 200)
-
-              git cat-file blob "$DIFF_BASE:$f" > "$BASE_BLOB" 2>/dev/null || : > "$BASE_BLOB"
-              git cat-file blob "HEAD:$f" > "$HEAD_BLOB" 2>/dev/null || : > "$HEAD_BLOB"
-              declared_versions "$BASE_BLOB" "$BASE_DECL"
-              declared_versions "$HEAD_BLOB" "$HEAD_DECL"
-
-              # cmp, not a shell string comparison: $( ) drops NUL bytes and
-              # trailing newlines, which is exactly how two different versions
-              # come to look equal. The drift check above guards the same
-              # boundary the same way.
-              if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
-                echo "version file $SAFE: changed, but declares the same version as the base."
-              else
-                # Covers a deletion as well as an edit: a version file the PR
-                # removes goes from declaring something to declaring nothing,
-                # which stays a version move, as it was before.
-                echo "version file $SAFE: the declared version changed between base and head."
-                MOVED=1
-              fi
-            done < "$CHANGED"
-          done
-
-          if [ "$MATCHED_ANY" = 0 ]; then
-            echo "::warning::None of the configured version_files (${FILES[*]}) exists at either revision, so this check can never fire. Fix the configured paths if that is not intended."
-          fi
-
-          if [ "$MOVED" = 0 ]; then
-            echo "This PR leaves the version declared in ${FILES[*]} unchanged — not a version bump, skipping tag check."
+          if cmp -s "$BASE_DECL" "$HEAD_DECL"; then
+            echo "package.json already declared $PKG on the base branch — this PR does not move the version, skipping tag check."
             exit 0
           fi
+          echo "package.json version differs from the base branch; this PR sets it to $PKG."
+
           TAG="${TAG_PREFIX}${PKG}"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             EXISTING=$(git rev-list -n 1 "refs/tags/$TAG")

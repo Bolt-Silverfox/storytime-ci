@@ -158,52 +158,68 @@ jobs:
           # release and then failed on the tag the unchanged version already
           # owns. Compare the declared values instead.
           #
-          # Per configured path:
-          #   * readable as a single JSON document on BOTH sides — compare the
-          #     declared version (.version, or Expo's .expo.version) inside jq,
-          #     never as shell strings. $( ) drops NUL bytes and trailing
-          #     newlines, which is exactly how two different values come to
-          #     look equal; the drift check above avoids that the same way.
-          #   * present on one side only — the file was added or deleted. A
-          #     deletion still counts as moving the version, as before: the
-          #     declared value went from something to nothing.
-          #   * anything not readable as JSON on both sides — a non-JSON
-          #     manifest a caller configured, a pathspec/glob, a malformed or
-          #     multi-document file — falls back to the old "did this path
-          #     change at all" diff. That is the conservative direction: the
-          #     fallback can only make the gate run, never make it skip.
+          # Per configured path, both sides read from git (never from the
+          # working tree, so an untracked or ignored file cannot masquerade as
+          # one this PR added):
+          #   * both sides are a single JSON document that declares a version
+          #     (.version, or Expo's .expo.version) — compare those two values
+          #     inside jq, never as shell strings. $( ) drops NUL bytes and
+          #     trailing newlines, which is exactly how two different values
+          #     come to look equal; the drift check above avoids that the same
+          #     way.
+          #   * tracked on one side only — added or deleted. A deletion still
+          #     counts as moving the version, as before: the declared value
+          #     went from something to nothing.
+          #   * anything else — a non-JSON manifest a caller configured, a
+          #     pathspec/glob, a directory, a malformed or multi-document file,
+          #     or JSON that declares no version we recognise on EITHER side —
+          #     falls back to the old "did this path change at all" diff. That
+          #     is the conservative direction: the fallback can only make the
+          #     gate run, never make it skip.
           BASE_BLOB=$(mktemp)
-          trap 'rm -f "$BASE_BLOB"' EXIT
+          HEAD_BLOB=$(mktemp)
+          trap 'rm -f "$BASE_BLOB" "$HEAD_BLOB"' EXIT
 
-          FILES=()
-          read -r -a FILES <<< "$VERSION_FILES"
+          # Plain word splitting, matching what the old unquoted `git diff --
+          # $VERSION_FILES` did: it splits on spaces, tabs AND newlines, so a
+          # caller writing the list as a YAML block scalar still gets every
+          # path. `read -a` would silently keep only the first line. Globs are
+          # left to expand exactly as they did before.
+          # shellcheck disable=SC2206
+          FILES=($VERSION_FILES)
           if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "::warning::version_files is empty, so there is nothing to compare — the tag-reuse check cannot run. Configure at least one manifest path."
-            exit 0
+            # Nothing to compare means nothing can prove this is not a bump, so
+            # fail closed and let the tag check run — the old behaviour for an
+            # empty list, which diffed the whole tree.
+            echo "::warning::version_files is empty, so no manifest could be compared; running the tag check unconditionally. Configure at least one manifest path."
+            FILES=()
+            MOVED=1
+          else
+            MOVED=0
           fi
 
-          MOVED=0
           for f in ${FILES[@]+"${FILES[@]}"}; do
             BASE_PRESENT=0
             if git cat-file blob "$BASE_SHA:$f" > "$BASE_BLOB" 2>/dev/null; then
               BASE_PRESENT=1
             fi
             HEAD_PRESENT=0
-            if [ -f "$f" ]; then
+            if git cat-file blob "HEAD:$f" > "$HEAD_BLOB" 2>/dev/null; then
               HEAD_PRESENT=1
             fi
 
-            REASON="not comparable as JSON"
             if [ "$BASE_PRESENT" = 1 ] && [ "$HEAD_PRESENT" = 1 ]; then
-              # "bad" cannot collide with a real value: tojson of the string
-              # bad is "\"bad\"", quotes included.
-              VERDICT=$(jq -n -r --slurpfile b "$BASE_BLOB" --slurpfile h "$f" '
+              # Neither sentinel can collide with a real value: tojson of the
+              # string bad is "\"bad\"" and of the string null is "\"null\"",
+              # quotes included, while JSON null renders as bare null.
+              VERDICT=$(jq -n -r --slurpfile b "$BASE_BLOB" --slurpfile h "$HEAD_BLOB" '
                 def declared:
                   if length != 1 then "bad"
                   else ((.[0] | (.version? // (.expo? | .version?) // null)) | tojson)
                   end;
                 ($b | declared) as $bv | ($h | declared) as $hv |
                 if $bv == "bad" or $hv == "bad" then "unknown"
+                elif $bv == "null" and $hv == "null" then "unknown"
                 elif $bv == $hv then "same"
                 else "moved"
                 end' 2>/dev/null) || VERDICT="unknown"
@@ -212,9 +228,9 @@ jobs:
               MOVED=1
               continue
             else
-              # Absent from both sides as a literal file. It may still be a
-              # pathspec that matches something, so let git answer.
-              REASON="no such file on either side"
+              # Not a tracked file on either side: a directory, a submodule, a
+              # glob, or simply absent. It may still be a pathspec that matches
+              # something, so let git answer.
               VERDICT="unknown"
             fi
 
@@ -228,9 +244,9 @@ jobs:
                 ;;
               unknown)
                 if git diff --quiet "$BASE_SHA" -- "$f"; then
-                  echo "$f: unchanged ($REASON; fell back to a file diff)."
+                  echo "$f: unchanged (no comparable JSON version on both sides; fell back to a file diff)."
                 else
-                  echo "$f: changed ($REASON; fell back to a file diff)."
+                  echo "$f: changed (no comparable JSON version on both sides; fell back to a file diff)."
                   MOVED=1
                 fi
                 ;;

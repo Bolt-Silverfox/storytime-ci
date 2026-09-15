@@ -13,7 +13,9 @@
 #      the tag present and silently skip, leaving the release untagged. The
 #      trigger is package.json's version VALUE differing from the base
 #      branch's, not whether any file was edited, so a dependency bump or a
-#      script edit is never mistaken for a release.
+#      script edit is not mistaken for a release. The one exception is a base
+#      revision the runner cannot read at all, where the check runs rather
+#      than assume; it says so in the log when that happens.
 name: version-check
 
 on:
@@ -163,9 +165,10 @@ jobs:
           # base branch declared something else — and that is the whole test.
           # No other file can make it true:
           #
-          #   * app.json cannot. The drift check above already forces
-          #     expo.version to equal package.json's, so if app.json moved on
-          #     its own this job has failed before reaching here; and deleting
+          #   * app.json cannot. A root app.json declaring expo.version is
+          #     held to package.json's version by the drift check above, so
+          #     moving it alone fails this job before reaching here; any other
+          #     app.json layout does not feed the tag at all. And deleting
           #     app.json cannot produce an untagged release, which is the harm
           #     this check exists to prevent. That is a deliberate narrowing of
           #     the old "a deletion counts as a change" rule, which fired on
@@ -173,7 +176,13 @@ jobs:
           #   * Nor can any other path, for the same reason: a tag reuse the PR
           #     did not introduce belongs to the base branch, not to this PR,
           #     and failing here would only tell the author to bump a version
-          #     they never edited.
+          #     they never edited. The trade is that a base branch already
+          #     sitting on a reused tag stays unreported until the next bump,
+          #     instead of failing every unrelated PR until someone notices.
+          #
+          # This rests on the tag being tag_prefix + root package.json .version:
+          # checked against every caller's release-tag.yml, all of which read
+          # `.version` from the root package.json and tag "v$VERSION".
           WORK=$(mktemp -d)
           trap 'rm -rf "$WORK"' EXIT
           BASE_BLOB="$WORK/base.blob"
@@ -320,7 +329,9 @@ jobs:
           # character, so passing this check also makes $TAG safe to echo —
           # a newline in a log line would start a new ::workflow-command::.
           if ! git check-ref-format "refs/tags/$TAG"; then
-            SAFE_TAG=$(printf '%s' "$TAG" | tr -d '\000-\037' | head -c 60)
+            # || true: head closing the pipe early would otherwise make this
+            # substitution exit 141 and kill the step before the message.
+            SAFE_TAG=$(printf '%s' "$TAG" | tr -d '\000-\037' | head -c 60 || true)
             echo "::error::tag_prefix produces an invalid git tag name ('$SAFE_TAG'), so the release tag could not be checked. Fix the tag_prefix input."
             exit 1
           fi

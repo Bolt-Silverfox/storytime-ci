@@ -12,7 +12,9 @@
 #      version to something that is already tagged, release-tag.yml would find
 #      the tag present and silently skip, leaving the release untagged. A PR
 #      that does not touch the version is ignored, so ordinary changes are
-#      never blocked by this.
+#      never blocked by this: the base and head manifests are compared by the
+#      version VALUE they declare, not by whether the file was edited, so a
+#      dependency bump in package.json is not mistaken for a release.
 name: version-check
 
 on:
@@ -20,7 +22,9 @@ on:
     inputs:
       version_files:
         description: >-
-          Space-separated paths whose change marks a PR as a version bump.
+          Space-separated paths whose declared version marks a PR as a version
+          bump. JSON manifests are compared by value (.version, or Expo's
+          .expo.version); any other path falls back to "was it edited at all".
           Defaults cover npm + Expo layouts.
         required: false
         type: string
@@ -144,15 +148,97 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           VERSION_FILES: ${{ inputs.version_files }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Pass every configured path straight to git rather than filtering by
-          # what exists in the working tree: a path missing on one side is
-          # exactly what a deletion looks like, and that still counts as a
-          # change to a version file. git ignores paths absent from both sides.
-          # shellcheck disable=SC2086
-          if git diff --quiet "$BASE_SHA" -- $VERSION_FILES; then
-            echo "This PR does not touch $VERSION_FILES — not a version bump, skipping tag check."
+          # The question this gate has to answer is "did the PR move the
+          # VERSION", not "did it touch a file that happens to carry one".
+          # Diffing the paths answered the second question, so adding a
+          # dependency or editing a script in package.json was classified as a
+          # release and then failed on the tag the unchanged version already
+          # owns. Compare the declared values instead.
+          #
+          # Per configured path:
+          #   * readable as a single JSON document on BOTH sides — compare the
+          #     declared version (.version, or Expo's .expo.version) inside jq,
+          #     never as shell strings. $( ) drops NUL bytes and trailing
+          #     newlines, which is exactly how two different values come to
+          #     look equal; the drift check above avoids that the same way.
+          #   * present on one side only — the file was added or deleted. A
+          #     deletion still counts as moving the version, as before: the
+          #     declared value went from something to nothing.
+          #   * anything not readable as JSON on both sides — a non-JSON
+          #     manifest a caller configured, a pathspec/glob, a malformed or
+          #     multi-document file — falls back to the old "did this path
+          #     change at all" diff. That is the conservative direction: the
+          #     fallback can only make the gate run, never make it skip.
+          BASE_BLOB=$(mktemp)
+          trap 'rm -f "$BASE_BLOB"' EXIT
+
+          FILES=()
+          read -r -a FILES <<< "$VERSION_FILES"
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::warning::version_files is empty, so there is nothing to compare — the tag-reuse check cannot run. Configure at least one manifest path."
+            exit 0
+          fi
+
+          MOVED=0
+          for f in ${FILES[@]+"${FILES[@]}"}; do
+            BASE_PRESENT=0
+            if git cat-file blob "$BASE_SHA:$f" > "$BASE_BLOB" 2>/dev/null; then
+              BASE_PRESENT=1
+            fi
+            HEAD_PRESENT=0
+            if [ -f "$f" ]; then
+              HEAD_PRESENT=1
+            fi
+
+            REASON="not comparable as JSON"
+            if [ "$BASE_PRESENT" = 1 ] && [ "$HEAD_PRESENT" = 1 ]; then
+              # "bad" cannot collide with a real value: tojson of the string
+              # bad is "\"bad\"", quotes included.
+              VERDICT=$(jq -n -r --slurpfile b "$BASE_BLOB" --slurpfile h "$f" '
+                def declared:
+                  if length != 1 then "bad"
+                  else ((.[0] | (.version? // (.expo? | .version?) // null)) | tojson)
+                  end;
+                ($b | declared) as $bv | ($h | declared) as $hv |
+                if $bv == "bad" or $hv == "bad" then "unknown"
+                elif $bv == $hv then "same"
+                else "moved"
+                end' 2>/dev/null) || VERDICT="unknown"
+            elif [ "$BASE_PRESENT" != "$HEAD_PRESENT" ]; then
+              echo "$f: added or deleted by this PR — the declared version moved to or from nothing."
+              MOVED=1
+              continue
+            else
+              # Absent from both sides as a literal file. It may still be a
+              # pathspec that matches something, so let git answer.
+              REASON="no such file on either side"
+              VERDICT="unknown"
+            fi
+
+            case "$VERDICT" in
+              same)
+                echo "$f: declared version unchanged from base."
+                ;;
+              moved)
+                echo "$f: declared version changed between base and head."
+                MOVED=1
+                ;;
+              unknown)
+                if git diff --quiet "$BASE_SHA" -- "$f"; then
+                  echo "$f: unchanged ($REASON; fell back to a file diff)."
+                else
+                  echo "$f: changed ($REASON; fell back to a file diff)."
+                  MOVED=1
+                fi
+                ;;
+            esac
+          done
+
+          if [ "$MOVED" = 0 ]; then
+            echo "This PR leaves the version declared in $VERSION_FILES unchanged — not a version bump, skipping tag check."
             exit 0
           fi
           TAG="${TAG_PREFIX}${PKG}"
